@@ -1,235 +1,404 @@
-import asyncio
-import json
+# client/client.py
 import sys
 import os
-from typing import Dict, Any, List
+import json
+import traceback
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import uvicorn
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from contextlib import AsyncExitStack
+import httpx
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.tools import StructuredTool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from pydantic import Field, create_model
+from typing import Any
+from urllib.parse import urlparse as _urlparse
 
-from config_utils import setup_llm_config
-import litellm
+load_dotenv()
 
-litellm.suppress_debug_info = True
+# Project root resolution that works when imported, run directly, or as a PyInstaller bundle
+if getattr(sys, 'frozen', False):
+    # Running as a bundled executable
+    project_root = os.path.dirname(sys.executable)
+else:
+    # Running in a normal Python environment
+    current_script_path = os.path.abspath(__file__)
+    client_dir = os.path.dirname(current_script_path)
+    project_root = os.path.abspath(os.path.join(client_dir, ".."))
 
-class LLMMCPClient:
-    def __init__(self, config_path: str):
-        self.config_path = config_path
-        self.stack = AsyncExitStack()
-        self.sessions: Dict[str, ClientSession] = {}
-        self.available_tools = []
-        
-        # Using environment file path if packaged, else just local .env
-        env_path = os.environ.get("ENV_PATH", ".env")
-        setup_llm_config(env_path)
-        self.model = os.environ.get("LLM_MODEL")
 
-    def _load_config(self) -> Dict[str, Any]:
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+def load_mcp_config():
+    config_path = os.path.join(project_root, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at: {config_path}")
 
-    async def connect_servers(self):
-        config = self._load_config()
-        servers = config.get("mcpServers", {})
-        
-        for name, server_config in servers.items():
-            print(f"Connecting to {name}...")
-            command = server_config.get("command")
-            args = server_config.get("args", [])
-            env = server_config.get("env", None)
-            
-            server_params = StdioServerParameters(command=command, args=args, env=env)
-            
-            stdio_transport = await self.stack.enter_async_context(stdio_client(server_params))
-            read, write = stdio_transport
-            session = await self.stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            
-            self.sessions[name] = session
-            print(f"Connected to {name} successfully.")
-            
-        await self._cache_tools()
+    print(f"📂 Reading config from: {config_path}")
+    with open(config_path, "r") as f:
+        config_data = json.load(f)
 
-    async def _cache_tools(self):
-        self.available_tools = []
-        self.connected_servers = list(self.sessions.keys())
-        for server_name, session in self.sessions.items():
-            response = await session.list_tools()
-            for tool in response.tools:
-                self.available_tools.append({
-                    "server": server_name,
-                    "mcp_tool": tool
-                })
+    if "mcpServers" in config_data:
+        config_data = config_data["mcpServers"]
 
-    def _get_llm_tools(self) -> List[Dict[str, Any]]:
-        llm_tools = []
-        for t in self.available_tools:
-            mcp_tool = t["mcp_tool"]
-            llm_tools.append({
-                "type": "function",
-                "function": {
-                    "name": mcp_tool.name,
-                    "description": mcp_tool.description or "",
-                    "parameters": mcp_tool.inputSchema
+    servers = {}
+    for server_name, settings in config_data.items():
+        transport = settings.get("transport", "stdio")
+
+        if transport == "sse":
+            url = settings.get("url")
+            api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
+            prefix = settings.get("prefix", "")
+
+            if not url or not api_key:
+                print(f"⚠️ Skipping SSE server '{server_name}': URL or API key missing.")
+                continue
+
+            # We'll use our own bridge mode by spawning this same application
+            if getattr(sys, 'frozen', False):
+                # Frozen: run the executable itself in bridge mode
+                command = sys.executable
+                args = ["--bridge", "--url", url, "--key", api_key]
+                if prefix:
+                    args += ["--prefix", prefix]
+            else:
+                # Dev: run 'python main.py' in bridge mode
+                command = sys.executable
+                main_script = os.path.join(project_root, "main.py")
+                args = [main_script, "--bridge", "--url", url, "--key", api_key]
+                if prefix:
+                    args += ["--prefix", prefix]
+
+            servers[server_name] = {
+                "_transport": "sse_direct",  # handled in-process; no subprocess needed
+                "url": url,
+                "api_key": api_key,
+                "prefix": prefix,
+            }
+            print(f"🌉 SSE direct registered: {server_name} → {url}")
+        elif transport == "stdio":
+            custom_command = settings.get("command")
+            custom_args = settings.get("args", [])
+            custom_env = settings.get("env", {})
+
+            resolved_env = {
+                k: os.getenv(v, v) for k, v in custom_env.items()
+            }
+            full_env = {**os.environ, **resolved_env} if resolved_env else None
+
+            if custom_command:
+                executable = custom_command
+                if custom_command == "python" or custom_command == "python3":
+                    executable = sys.executable
+                
+                # If command is a relative path, resolve it against project_root
+                if not os.path.isabs(executable) and not executable.startswith(("uvx", "npx")):
+                    candidate_path = os.path.abspath(os.path.join(project_root, executable))
+                    if os.path.exists(candidate_path):
+                        executable = candidate_path
+                    elif os.path.exists(candidate_path + ".exe"): # Windows fallback
+                        executable = candidate_path + ".exe"
+                
+                server_config = {
+                    "transport": "stdio",
+                    "command": executable,
+                    "args": custom_args,
                 }
-            })
-        return llm_tools
+                if full_env:
+                    server_config["env"] = full_env
 
-    async def run_chat_loop(self):
-        try:
-            await self.connect_servers()
-        except Exception as e:
-            print(f"Error connecting to servers: {e}")
-            return
-
-        print("\n" + "="*50)
-        print(f"MCP Client Ready! Using Model: {self.model}")
-        print("Type 'exit' or 'quit' to close.")
-        print("="*50 + "\n")
-        
-        
-        server_names = ", ".join(self.connected_servers)
-        system_prompt = (
-            "You are a sophisticated AI assistant connected to the Model Context Protocol (MCP). "
-            f"You have direct access to the following connected MCP servers: {server_names}. "
-            "When the user asks about your capabilities, servers, or resources, explain that you "
-            f"are connected to these MCP servers ({server_names}) and you can use their attached tools to read systems, files, and external APIs. "
-            "Use the provided tools to help the user directly."
-        )
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        while True:
-            try:
-                user_msg = input("You: ").strip()
-                if user_msg.lower() in ('quit', 'exit'):
-                    break
-                if not user_msg:
+                servers[server_name] = server_config
+                print(f"🔧 stdio (custom cmd) registered: {server_name} → {executable}")
+    
+            else:
+                script_rel_path = settings.get("script_path")
+                if not script_rel_path:
                     continue
-            except (EOFError, KeyboardInterrupt):
-                break
+                script_abs_path = os.path.join(project_root, script_rel_path)
+                servers[server_name] = {
+                    "transport": "stdio",
+                    "command": sys.executable,
+                    "args": [script_abs_path],
+                }
+                print(f"🖥️ stdio server registered: {server_name} → {script_abs_path}")
 
-            messages.append({"role": "user", "content": user_msg})
-            
-            # Agentic tool calling loop
-            error_retries = 0
-            max_error_retries = 3
-            while True:
-                try:
-                    kwargs = {
-                        "model": self.model,
-                        "messages": messages,
-                        "tools": self._get_llm_tools() if self.available_tools else None
-                    }
-                    if os.environ.get("AZURE_OPENAI_ENDPOINT"):
-                        kwargs["api_base"] = os.environ.get("AZURE_OPENAI_ENDPOINT")
-                    elif os.environ.get("AZURE_API_BASE"):
-                        kwargs["api_base"] = os.environ.get("AZURE_API_BASE")
-                    
-                    if os.environ.get("AZURE_API_VERSION"):
-                        kwargs["api_version"] = os.environ.get("AZURE_API_VERSION")
+    return servers
 
-                    response = await litellm.acompletion(**kwargs)
-                    error_retries = 0  # Reset on success
-                except Exception as e:
-                    error_str = str(e)
-                    # For authentication or connection issues, we ask to reconfigure
-                    if "AuthenticationError" in error_str or "APIConnectionError" in error_str or "NotFoundError" in error_str or "invalid_api_key" in error_str or "model_decommissioned" in error_str:
-                        print(f"\n[!] LLM Connection Error: {error_str}")
-                        print("[!] Hint: Make sure the Model Name actually exists on your selected provider and your API Key is valid.")
-                        retry = input("Would you like to reconfigure your LLM settings now? (y/n): ").strip().lower()
-                        if retry == 'y':
-                            env_path = os.environ.get("ENV_PATH", ".env")
-                            if os.path.exists(env_path):
-                                os.remove(env_path)
-                            for key in ["LLM_MODEL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "AZURE_API_KEY"]:
-                                if key in os.environ:
-                                    del os.environ[key]
-                            from config_utils import setup_llm_config
-                            setup_llm_config(env_path)
-                            self.model = os.environ.get("LLM_MODEL")
-                            print(f"\nResuming query with model {self.model}...\n")
-                            error_retries = 0
-                            continue
-                        else:
-                            break
-                    else:
-                        error_retries += 1
-                        print(f"\n[DEBUG] LiteLLM Error: {error_str}")
-                        if error_retries >= max_error_retries:
-                            print(f"\nAI: Sorry, I encountered a repeated error and couldn't complete your request. Please try rephrasing your question.\n")
-                            break
-                        # Feed error back to LLM so it can respond naturally (but only up to max_error_retries times)
-                        messages.append({
-                            "role": "user", 
-                            "content": f"System Warning: Your previous tool call failed with: {error_str}. Do NOT call any tools. Just respond to the user in natural language explaining what went wrong."
-                        })
-                        continue
 
-                response_msg = response.choices[0].message
-                
-                # Append the assistant's message to the conversation
-                # litellm returns objects that can be directly passed back in many cases, but we need dict representation
-                messages.append(response_msg.model_dump())
-                
-                if response_msg.tool_calls:
-                    for tool_call in response_msg.tool_calls:
-                        func_name = tool_call.function.name
-                        try:
-                            func_args = json.loads(tool_call.function.arguments)
-                        except:
-                            func_args = {}
-                            
-                        print(f"[{self.model}] Executing tool '{func_name}' with kwargs: {func_args}")
-                        
-                        target_server = None
-                        for t in self.available_tools:
-                            if t["mcp_tool"].name == func_name:
-                                target_server = t["server"]
-                                break
-                                
-                        if not target_server:
-                            result_text = f"Tool {func_name} not found across active MCP servers."
+# ---------------------------------------------------------------------------
+# In-process SSE MCP client (avoids subprocess bridge on Windows)
+# ---------------------------------------------------------------------------
+
+async def _sse_rpc(sse_url: str, api_key: str, prefix: str,
+                   method: str, params: dict, timeout: float = 30.0) -> dict:
+    """
+    Open a fresh SSE session, perform the MCP initialize handshake,
+    execute ONE method call, and return the JSON-RPC result dict.
+    No subprocess is spawned — everything runs in the gateway process.
+    """
+    sse_hdrs = {"x-api-key": api_key, "Accept": "text/event-stream", "Cache-Control": "no-store"}
+    post_hdrs = {"x-api-key": api_key, "Content-Type": "application/json"}
+    q: asyncio.Queue = asyncio.Queue()
+    ready = asyncio.Event()
+    purl: list = [None]
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
+
+        async def _sse_reader():
+            async with http.stream("GET", sse_url, headers=sse_hdrs) as resp:
+                resp.raise_for_status()
+                async for ln in resp.aiter_lines():
+                    if not ln or ln.startswith(":") or ln.startswith("event:"): continue
+                    if ln.startswith("data:"):
+                        data = ln[5:].strip()
+                        if purl[0] is None:
+                            path = (prefix + data) if prefix and not data.startswith(prefix) else data
+                            p = _urlparse(sse_url)
+                            purl[0] = f"{p.scheme}://{p.netloc}{path}"
+                            ready.set()
                         else:
                             try:
-                                session = self.sessions[target_server]
-                                result = await session.call_tool(func_name, arguments=func_args)
-                                result_text = "\n".join(
-                                    item.text for item in result.content if item.type == "text"
-                                )
-                            except Exception as e:
-                                result_text = f"Error executing tool: {e}"
-                                
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": func_name,
-                            "content": result_text
-                        })
-                else: 
-                    # End of agentic loop
-                    print(f"\nAI: {response_msg.content}\n")
-                    break
+                                await q.put(json.loads(data))
+                            except Exception:
+                                pass
 
-        print("\nShutting down connections...")
-        os._exit(0)
+        sse_task = asyncio.ensure_future(_sse_reader())
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+            url = purl[0]
+
+            # MCP initialize
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "mcp-gateway", "version": "1.0"}}
+            })
+            await asyncio.wait_for(q.get(), timeout=timeout)
+
+            # initialized notification (fire-and-forget)
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+            })
+
+            # actual method call
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            })
+            result_msg = await asyncio.wait_for(q.get(), timeout=timeout)
+            return result_msg.get("result", {})
+        finally:
+            sse_task.cancel()
+            try:
+                await sse_task
+            except asyncio.CancelledError:
+                pass
 
 
-def run_llm_client():
-    config_path = os.environ.get("MCP_CONFIG_PATH", "config.json")
-    if getattr(sys, 'frozen', False):
-        base_path = os.path.dirname(sys.executable)
-        config_path = os.path.join(base_path, config_path)
-        # Check if environment file is generated next to executable
-        os.environ["ENV_PATH"] = os.path.join(base_path, ".env")
+def _make_tool_input_model(tool_name: str, schema: dict):
+    """Build a Pydantic model from an MCP tool's inputSchema."""
+    properties = schema.get("properties", {})
+    required_fields = schema.get("required", [])
+    fields: dict = {}
+    for pname, pschema in properties.items():
+        ptype_str = pschema.get("type", "string")
+        ptype: Any = str
+        if ptype_str in ("number", "integer"): ptype = float
+        elif ptype_str == "boolean": ptype = bool
+        elif ptype_str == "array": ptype = list
+        elif ptype_str == "object": ptype = dict
+        default = ... if pname in required_fields else None
+        desc = pschema.get("description", pname)
+        fields[pname] = (ptype, Field(default, description=desc))
+    if not fields:
+        return type("EmptyInput", (object,), {"__annotations__": {}})
+    return create_model(f"{tool_name}Input", **fields)
+
+
+async def get_sse_tools_direct(server_name: str, sse_url: str, api_key: str,
+                                prefix: str = "", timeout: float = 30.0) -> list:
+    """
+    Discover AND wrap tools from an SSE MCP server entirely in-process.
+    Returns LangChain StructuredTool objects with async execution support.
+    """
+    raw = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
+    tool_defs = raw.get("tools", [])
+    lc_tools = []
+
+    for t in tool_defs:
+        name = t["name"]
+        desc = t.get("description", "")
+        schema = t.get("inputSchema", {})
+        input_model = _make_tool_input_model(name, schema)
+
+        # Capture closure variables explicitly
+        _url, _key, _pfx, _tname = sse_url, api_key, prefix, name
+
+        async def _arun(_n=_tname, _u=_url, _k=_key, _p=_pfx, **kwargs):
+            result = await _sse_rpc(_u, _k, _p, "tools/call",
+                                    {"name": _n, "arguments": kwargs}, timeout=60.0)
+            content = result.get("content", [])
+            parts = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
+            return "\n".join(parts) if parts else str(result)
+
+        lc_tools.append(StructuredTool(
+            name=name,
+            description=desc,
+            args_schema=input_model,
+            coroutine=_arun,
+        ))
+
+    return lc_tools
+
+
+async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
+    all_tools = []
+    failed_servers = []
+
+    for server_name, server_config in all_servers.items():
+        try:
+            print(f"🔌 Connecting to '{server_name}'...")
+
+            if server_config.get("_transport") == "sse_direct":
+                # In-process SSE client: avoids slow subprocess startup on Windows
+                tools = await asyncio.wait_for(
+                    get_sse_tools_direct(
+                        server_name,
+                        server_config["url"],
+                        server_config["api_key"],
+                        server_config.get("prefix", ""),
+                    ),
+                    timeout=30.0,
+                )
+            else:
+                client = MultiServerMCPClient({server_name: server_config})
+                # Use a longer timeout (60s) for tool discovery to account for slow startup (especially on Windows)
+                tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+
+            all_tools.extend(tools)
+            print(f"✅ Loaded {len(tools)} tools from '{server_name}'")
+        except asyncio.TimeoutError:
+            print(f"⏱️ Timeout connecting to '{server_name}' — skipping.")
+            failed_servers.append(server_name)
+        except Exception as e:
+            print(f"❌ Failed to load tools from '{server_name}': {e}")
+            failed_servers.append(server_name)
+
+    return all_tools, failed_servers
+
+
+mcp_servers = {}
+cached_tools = []
+failed_servers = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mcp_servers, cached_tools, failed_servers
+    try:
+        mcp_servers = load_mcp_config()
+        print(f"🔌 Servers configured: {list(mcp_servers.keys())}")
         
-    if not os.path.exists(config_path):
-        print(f"Error: {config_path} not found.")
-        sys.exit(1)
+        # Discover and cache tools at startup
+        print("🔍 Initializing MCP tools...")
+        cached_tools, failed_servers = await get_tools_safe(mcp_servers)
         
-    client = LLMMCPClient(config_path)
-    asyncio.run(client.run_chat_loop())
+        if failed_servers:
+            print(f"⚠️ Some servers failed to load at startup: {failed_servers}")
+        print(f"✅ Startup complete. {len(cached_tools)} tools cached.")
+        
+        yield
+    except Exception as e:
+        print(f"❌ Error during startup: {e}")
+        raise
+    finally:
+        print("🔌 Shutting down...")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+class QueryRequest(BaseModel):
+    prompt: str
+    thread_id: str = "default_thread"
+
+# Initialize in-memory checkpointer
+memory = MemorySaver()
+
+
+@app.post("/chat")
+async def chat_endpoint(request: QueryRequest):
+    global mcp_servers, cached_tools, failed_servers
+
+    if not mcp_servers:
+        raise HTTPException(status_code=500, detail="No MCP servers configured")
+
+    try:
+        # Use cached tools instead of re-discovering them
+        tools = cached_tools
+        failed = failed_servers
+
+        if not tools:
+            # OPTIONAL: If no tools were cached at startup, try one more time or fail
+            if not failed:
+                 raise HTTPException(status_code=503, detail="No tools available.")
+            else:
+                 raise HTTPException(
+                    status_code=503,
+                    detail=f"No tools available. All servers failed at startup: {failed}"
+                )
+
+        if failed:
+            print(f"⚠️ Proceeding with cached tools (excluding failed: {failed})")
+
+        llm = AzureChatOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME")
+        )
+
+        # Create the agent with memory persistence
+        agent = create_react_agent(llm, tools, checkpointer=memory)
+        
+        # Configure the thread ID for history
+        config = {"configurable": {"thread_id": request.thread_id}}
+        
+        # Invoke the agent
+        inputs = {"messages": [HumanMessage(content=request.prompt)]}
+        result = await agent.ainvoke(inputs, config=config)
+        
+        # Get the final response message
+        final_message = result["messages"][-1]
+        result_content = final_message.content
+        
+        if failed:
+            result_content += f"\n\n⚠️ Note: These servers were unavailable: {failed}"
+            
+        return {"response": result_content}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Exception in chat_endpoint:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tools")
+async def list_tools():
+    # Return cached tools directly
+    return {
+        "loaded": [t.name for t in cached_tools],
+        "failed_servers": failed_servers
+    }
+
+def start_gateway(host="0.0.0.0", port=8010):
+    print(f"🚀 Starting MCP Gateway on {host}:{port}...")
+    uvicorn.run(app, host=host, port=port)
 
 if __name__ == "__main__":
-    run_llm_client()
+    start_gateway()
