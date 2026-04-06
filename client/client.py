@@ -20,7 +20,19 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import Field, create_model
 from typing import Any
 from urllib.parse import urlparse as _urlparse
+import sys
+import os
+import json
+import traceback
+import asyncio
+import ssl
 
+# --- Add this block to bypass corporate SSL/VPN issues ---
+os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'  # Bypasses SSL for JS tools
+os.environ['PYTHONHTTPSVERIFY'] = '0'             # Bypasses SSL for Python tools
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+ssl._create_default_https_context = ssl._create_unverified_context
 load_dotenv()
 
 if getattr(sys, 'frozen', False):
