@@ -50,29 +50,34 @@ def load_mcp_config():
     for server_name, settings in config_data.items():
         transport = settings.get("transport", "stdio")
 
-        if transport == "sse":
+        # Accept both sse and http, treating them the same under the hood
+        if transport in ("sse", "http"):
             url = settings.get("url")
-            api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
+            api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key", "")
             prefix = settings.get("prefix", "")
 
-            if not url or not api_key:
-                print(f"⚠️ Skipping SSE server '{server_name}': URL or API key missing.")
+            if not url:
+                print(f"⚠️ Skipping network server '{server_name}': URL missing.")
                 continue
 
             # We'll use our own bridge mode by spawning this same application
             if getattr(sys, 'frozen', False):
                 # Frozen: run the executable itself in bridge mode
                 command = sys.executable
-                args = ["--bridge", "--url", url, "--key", api_key]
+                args = ["--bridge", "--url", url]
+                if api_key:
+                    args.extend(["--key", api_key])
                 if prefix:
-                    args += ["--prefix", prefix]
+                    args.extend(["--prefix", prefix])
             else:
                 # Dev: run 'python main.py' in bridge mode
                 command = sys.executable
                 main_script = os.path.join(project_root, "main.py")
-                args = [main_script, "--bridge", "--url", url, "--key", api_key]
+                args = [main_script, "--bridge", "--url", url]
+                if api_key:
+                    args.extend(["--key", api_key])
                 if prefix:
-                    args += ["--prefix", prefix]
+                    args.extend(["--prefix", prefix])
 
             servers[server_name] = {
                 "_transport": "sse_direct",  # handled in-process; no subprocess needed
@@ -80,7 +85,8 @@ def load_mcp_config():
                 "api_key": api_key,
                 "prefix": prefix,
             }
-            print(f"🌉 SSE direct registered: {server_name} → {url}")
+            print(f"🌉 Network direct registered: {server_name} → {url}")
+            
         elif transport == "stdio":
             custom_command = settings.get("command")
             custom_args = settings.get("args", [])
@@ -141,8 +147,14 @@ async def _sse_rpc(sse_url: str, api_key: str, prefix: str,
     execute ONE method call, and return the JSON-RPC result dict.
     No subprocess is spawned — everything runs in the gateway process.
     """
-    sse_hdrs = {"x-api-key": api_key, "Accept": "text/event-stream", "Cache-Control": "no-store"}
-    post_hdrs = {"x-api-key": api_key, "Content-Type": "application/json"}
+    sse_hdrs = {"Accept": "text/event-stream", "Cache-Control": "no-store"}
+    post_hdrs = {"Content-Type": "application/json"}
+    
+    # Inject API key conditionally
+    if api_key:
+        sse_hdrs["x-api-key"] = api_key
+        post_hdrs["x-api-key"] = api_key
+
     q: asyncio.Queue = asyncio.Queue()
     ready = asyncio.Event()
     purl: list = [None]
@@ -276,7 +288,7 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
                 )
             else:
                 client = MultiServerMCPClient({server_name: server_config})
-                # Use a longer timeout (60s) for tool discovery to account for slow startup (especially on Windows)
+                # Use a longer timeout (60s) for tool discovery to account for slow startup
                 tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
 
             all_tools.extend(tools)
