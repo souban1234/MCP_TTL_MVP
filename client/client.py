@@ -11,28 +11,17 @@ from dotenv import load_dotenv
 import uvicorn
 
 import httpx
+from fastmcp import Client as FastMCPClient
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from pydantic import Field, create_model
 from typing import Any
 from urllib.parse import urlparse as _urlparse
-import sys
-import os
-import json
-import traceback
-import asyncio
-import ssl
 
-# --- Add this block to bypass corporate SSL/VPN issues ---
-os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'  # Bypasses SSL for JS tools
-os.environ['PYTHONHTTPSVERIFY'] = '0'             # Bypasses SSL for Python tools
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-ssl._create_default_https_context = ssl._create_unverified_context
 load_dotenv()
 
 if getattr(sys, 'frozen', False):
@@ -42,6 +31,10 @@ else:
     client_dir = os.path.dirname(current_script_path)
     project_root = os.path.abspath(os.path.join(client_dir, ".."))
 
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
 
 def load_mcp_config():
     config_path = os.path.join(project_root, "config.json")
@@ -60,38 +53,42 @@ def load_mcp_config():
     for server_name, settings in config_data.items():
         transport = settings.get("transport", "stdio")
 
-        # ── STREAMABLE HTTP (FastMCP default) ─────────────────────────────
-        if transport == "streamable_http":
+        # ── FASTMCP HTTP (uses fastmcp.Client directly) ───────────────────
+        if transport == "fastmcp_http":
             url = settings.get("url")
             if not url:
                 print(f"⚠️  Skipping '{server_name}': no URL provided.")
                 continue
+            servers[server_name] = {
+                "_transport": "fastmcp_http",
+                "url": url,
+            }
+            print(f"⚡ fastmcp_http registered: {server_name} → {url}")
 
+        # ── STREAMABLE HTTP (MultiServerMCPClient native) ─────────────────
+        elif transport == "streamable_http":
+            url = settings.get("url")
+            if not url:
+                print(f"⚠️  Skipping '{server_name}': no URL provided.")
+                continue
+            server_cfg = {"transport": "streamable_http", "url": url}
             headers = settings.get("headers", {})
             api_key = settings.get("api_key")
             if api_key:
                 headers["x-api-key"] = api_key
-
-            server_cfg = {
-                "transport": "streamable_http",
-                "url": url,
-            }
             if headers:
                 server_cfg["headers"] = headers
-
             servers[server_name] = server_cfg
             print(f"🌐 streamable_http registered: {server_name} → {url}")
 
-        # ── SSE (legacy remote servers) ────────────────────────────────────
+        # ── SSE (legacy, in-process bridge) ──────────────────────────────
         elif transport == "sse":
             url = settings.get("url")
             api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
             prefix = settings.get("prefix", "")
-
             if not url or not api_key:
                 print(f"⚠️  Skipping SSE server '{server_name}': URL or API key missing.")
                 continue
-
             servers[server_name] = {
                 "_transport": "sse_direct",
                 "url": url,
@@ -100,7 +97,7 @@ def load_mcp_config():
             }
             print(f"🌉 SSE direct registered: {server_name} → {url}")
 
-        # ── STDIO (local servers) ──────────────────────────────────────────
+        # ── STDIO ─────────────────────────────────────────────────────────
         elif transport == "stdio":
             custom_command = settings.get("command")
             custom_args = settings.get("args", [])
@@ -113,14 +110,12 @@ def load_mcp_config():
                 executable = custom_command
                 if custom_command in ("python", "python3"):
                     executable = sys.executable
-
                 if not os.path.isabs(executable) and not executable.startswith(("uvx", "npx")):
                     candidate = os.path.abspath(os.path.join(project_root, executable))
                     if os.path.exists(candidate):
                         executable = candidate
                     elif os.path.exists(candidate + ".exe"):
                         executable = candidate + ".exe"
-
                 server_cfg = {
                     "transport": "stdio",
                     "command": executable,
@@ -128,10 +123,8 @@ def load_mcp_config():
                 }
                 if full_env:
                     server_cfg["env"] = full_env
-
                 servers[server_name] = server_cfg
                 print(f"🔧 stdio registered: {server_name} → {executable}")
-
             else:
                 script_rel_path = settings.get("script_path")
                 if not script_rel_path:
@@ -142,24 +135,104 @@ def load_mcp_config():
                     "command": sys.executable,
                     "args": [script_abs_path],
                 }
-                print(f"🖥️  stdio server registered: {server_name} → {script_abs_path}")
+                print(f"🖥️  stdio registered: {server_name} → {script_abs_path}")
 
         else:
-            print(f"⚠️  Unknown transport '{transport}' for server '{server_name}' — skipping.")
+            print(f"⚠️  Unknown transport '{transport}' for '{server_name}' — skipping.")
 
     return servers
 
 
 # ---------------------------------------------------------------------------
-# In-process SSE client (legacy path — unchanged from original)
+# Pydantic model builder (shared by SSE and fastmcp_http paths)
+# ---------------------------------------------------------------------------
+
+def _make_tool_input_model(tool_name: str, schema: dict):
+    properties = schema.get("properties", {})
+    required_fields = schema.get("required", [])
+    fields: dict = {}
+    for pname, pschema in properties.items():
+        ptype_str = pschema.get("type", "string")
+        ptype: Any = str
+        if ptype_str in ("number", "integer"):
+            ptype = float
+        elif ptype_str == "boolean":
+            ptype = bool
+        elif ptype_str == "array":
+            ptype = list
+        elif ptype_str == "object":
+            ptype = dict
+        default = ... if pname in required_fields else None
+        desc = pschema.get("description", pname)
+        fields[pname] = (ptype, Field(default, description=desc))
+    if not fields:
+        return type("EmptyInput", (object,), {"__annotations__": {}})
+    return create_model(f"{tool_name}Input", **fields)
+
+
+# ---------------------------------------------------------------------------
+# fastmcp_http: use fastmcp.Client directly (same library as app.py)
+# ---------------------------------------------------------------------------
+
+async def get_fastmcp_tools(server_name: str, url: str, timeout: float = 30.0) -> list:
+    """
+    Discover tools from a FastMCP HTTP server using fastmcp.Client,
+    then wrap each as a LangChain StructuredTool with an async executor.
+    """
+    print(f"   🔍 Listing tools from FastMCP server at {url} ...")
+
+    # Discover tools — open a short-lived session
+    async with FastMCPClient(url) as client:
+        raw_tools = await client.list_tools()
+
+    print(f"   📋 Discovered {len(raw_tools)} tools: {[t.name for t in raw_tools]}")
+
+    lc_tools = []
+    for t in raw_tools:
+        name        = t.name
+        desc        = t.description or ""
+        schema      = t.inputSchema or {}
+        input_model = _make_tool_input_model(name, schema)
+
+        # Capture per-tool closure variables
+        _url   = url
+        _tname = name
+
+        async def _arun(_n=_tname, _u=_url, **kwargs):
+            """Call the tool on the remote FastMCP server."""
+            async with FastMCPClient(_u) as c:
+                result = await c.call_tool(_n, kwargs)
+            # result is a list of TextContent / ImageContent etc.
+            parts = []
+            for item in result:
+                if hasattr(item, "text"):
+                    parts.append(item.text)
+                elif hasattr(item, "data"):
+                    parts.append(str(item.data))
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts) if parts else "(no content returned)"
+
+        lc_tools.append(StructuredTool(
+            name=name,
+            description=desc,
+            args_schema=input_model,
+            coroutine=_arun,
+        ))
+
+    return lc_tools
+
+
+# ---------------------------------------------------------------------------
+# In-process SSE client (legacy — unchanged)
 # ---------------------------------------------------------------------------
 
 async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
-    sse_hdrs = {"x-api-key": api_key, "Accept": "text/event-stream", "Cache-Control": "no-store"}
+    sse_hdrs  = {"x-api-key": api_key, "Accept": "text/event-stream", "Cache-Control": "no-store"}
     post_hdrs = {"x-api-key": api_key, "Content-Type": "application/json"}
-    q = asyncio.Queue()
+    q     = asyncio.Queue()
     ready = asyncio.Event()
-    purl = [None]
+    purl  = [None]
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
 
@@ -208,72 +281,51 @@ async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
                 pass
 
 
-def _make_tool_input_model(tool_name, schema):
-    properties = schema.get("properties", {})
-    required_fields = schema.get("required", [])
-    fields = {}
-    for pname, pschema in properties.items():
-        ptype_str = pschema.get("type", "string")
-        ptype = str
-        if ptype_str in ("number", "integer"):
-            ptype = float
-        elif ptype_str == "boolean":
-            ptype = bool
-        elif ptype_str == "array":
-            ptype = list
-        elif ptype_str == "object":
-            ptype = dict
-        default = ... if pname in required_fields else None
-        desc = pschema.get("description", pname)
-        fields[pname] = (ptype, Field(default, description=desc))
-    if not fields:
-        return type("EmptyInput", (object,), {"__annotations__": {}})
-    return create_model(f"{tool_name}Input", **fields)
-
-
 async def get_sse_tools_direct(server_name, sse_url, api_key, prefix="", timeout=30.0):
-    raw = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
+    raw      = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
     tool_defs = raw.get("tools", [])
-    lc_tools = []
+    lc_tools  = []
     for t in tool_defs:
-        name = t["name"]
-        desc = t.get("description", "")
-        schema = t.get("inputSchema", {})
+        name        = t["name"]
+        desc        = t.get("description", "")
+        schema      = t.get("inputSchema", {})
         input_model = _make_tool_input_model(name, schema)
         _url, _key, _pfx, _tname = sse_url, api_key, prefix, name
 
         async def _arun(_n=_tname, _u=_url, _k=_key, _p=_pfx, **kwargs):
-            result = await _sse_rpc(_u, _k, _p, "tools/call",
-                                    {"name": _n, "arguments": kwargs}, timeout=60.0)
+            result  = await _sse_rpc(_u, _k, _p, "tools/call",
+                                     {"name": _n, "arguments": kwargs}, timeout=60.0)
             content = result.get("content", [])
-            parts = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
+            parts   = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
             return "\n".join(parts) if parts else str(result)
 
         lc_tools.append(StructuredTool(
-            name=name,
-            description=desc,
-            args_schema=input_model,
-            coroutine=_arun,
+            name=name, description=desc,
+            args_schema=input_model, coroutine=_arun,
         ))
     return lc_tools
 
 
 # ---------------------------------------------------------------------------
-# Tool discovery — handles all transport types
+# Unified tool discovery
 # ---------------------------------------------------------------------------
 
 async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
-    all_tools = []
+    all_tools      = []
     failed_servers = []
 
     for server_name, server_config in all_servers.items():
         try:
             print(f"🔌 Connecting to '{server_name}'...")
-
             transport = server_config.get("_transport") or server_config.get("transport")
 
-            if transport == "sse_direct":
-                # Legacy SSE — in-process client
+            if transport == "fastmcp_http":
+                tools = await asyncio.wait_for(
+                    get_fastmcp_tools(server_name, server_config["url"]),
+                    timeout=60.0,
+                )
+
+            elif transport == "sse_direct":
                 tools = await asyncio.wait_for(
                     get_sse_tools_direct(
                         server_name,
@@ -284,15 +336,10 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
                     timeout=30.0,
                 )
 
-            elif transport == "streamable_http":
-                # ✅ FastMCP streamable HTTP — MultiServerMCPClient handles this natively
-                client = MultiServerMCPClient({server_name: server_config})
-                tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
-
             else:
-                # stdio
+                # streamable_http or stdio — MultiServerMCPClient handles both
                 client = MultiServerMCPClient({server_name: server_config})
-                tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+                tools  = await asyncio.wait_for(client.get_tools(), timeout=60.0)
 
             all_tools.extend(tools)
             print(f"✅ Loaded {len(tools)} tools from '{server_name}'")
@@ -302,13 +349,18 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
             failed_servers.append(server_name)
         except Exception as e:
             print(f"❌ Failed to load tools from '{server_name}': {e}")
+            traceback.print_exc()
             failed_servers.append(server_name)
 
     return all_tools, failed_servers
 
 
-mcp_servers = {}
-cached_tools = []
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+mcp_servers    = {}
+cached_tools   = []
 failed_servers = []
 
 
@@ -350,7 +402,7 @@ async def chat_endpoint(request: QueryRequest):
         raise HTTPException(status_code=500, detail="No MCP servers configured")
 
     try:
-        tools = cached_tools
+        tools  = cached_tools
         failed = failed_servers
 
         if not tools:
@@ -359,24 +411,19 @@ async def chat_endpoint(request: QueryRequest):
                 detail=f"No tools available. Failed servers: {failed}"
             )
 
-        if failed:
-            print(f"⚠️  Proceeding without failed servers: {failed}")
-
         llm = AzureChatOpenAI(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME")
+            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
         )
 
-        agent = create_react_agent(llm, tools, checkpointer=memory)
+        agent  = create_react_agent(llm, tools, checkpointer=memory)
         config = {"configurable": {"thread_id": request.thread_id}}
         inputs = {"messages": [HumanMessage(content=request.prompt)]}
         result = await agent.ainvoke(inputs, config=config)
 
-        final_message = result["messages"][-1]
-        result_content = final_message.content
-
+        result_content = result["messages"][-1].content
         if failed:
             result_content += f"\n\n⚠️ Note: These servers were unavailable: {failed}"
 
@@ -394,7 +441,7 @@ async def chat_endpoint(request: QueryRequest):
 async def list_tools():
     return {
         "loaded": [t.name for t in cached_tools],
-        "failed_servers": failed_servers
+        "failed_servers": failed_servers,
     }
 
 
