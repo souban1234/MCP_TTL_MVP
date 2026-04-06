@@ -101,10 +101,9 @@ def main():
                 "api_key": "sk-X-R9VlE6FJL0E16KRu1Sp1Edisi2KmSR6luTM5gcCRc",
                 "prefix": "/agentbuilder-api"
             },
-            "my-local-fastmcp": {
-                "transport": "http",
-                "url": "http://172.28.125.72:8000/sse",
-                "prefix": ""
+            "chromosome-mcp-server": {
+              "transport": "streamable_http",
+              "url": "https://chromosome.tatatechnologies.com/mcp-server/mcp"
             }
         }
     }
