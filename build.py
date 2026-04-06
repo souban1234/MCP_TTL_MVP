@@ -102,8 +102,8 @@ def main():
                 "prefix": "/agentbuilder-api"
             },
             "my-local-fastmcp": {
-                "transport": "sse",
-                "url": "http://127.0.0.1:8001/sse",
+                "transport": "http",
+                "url": "http://172.28.125.72:8000/sse",
                 "prefix": ""
             }
         }
