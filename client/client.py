@@ -9,9 +9,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
+import ssl
 
 import httpx
-from fastmcp import Client as FastMCPClient
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -22,6 +22,14 @@ from pydantic import Field, create_model
 from typing import Any
 from urllib.parse import urlparse as _urlparse
 
+# --- SSL Bypass for corporate networks ---
+os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+ssl._create_default_https_context = ssl._create_unverified_context
+# -----------------------------------------
+
 load_dotenv()
 
 if getattr(sys, 'frozen', False):
@@ -30,7 +38,6 @@ else:
     current_script_path = os.path.abspath(__file__)
     client_dir = os.path.dirname(current_script_path)
     project_root = os.path.abspath(os.path.join(client_dir, ".."))
-
 
 # ---------------------------------------------------------------------------
 # Config loader
@@ -53,20 +60,8 @@ def load_mcp_config():
     for server_name, settings in config_data.items():
         transport = settings.get("transport", "stdio")
 
-        # ── FASTMCP HTTP (uses fastmcp.Client directly) ───────────────────
-        if transport == "fastmcp_http":
-            url = settings.get("url")
-            if not url:
-                print(f"⚠️  Skipping '{server_name}': no URL provided.")
-                continue
-            servers[server_name] = {
-                "_transport": "fastmcp_http",
-                "url": url,
-            }
-            print(f"⚡ fastmcp_http registered: {server_name} → {url}")
-
         # ── STREAMABLE HTTP (MultiServerMCPClient native) ─────────────────
-        elif transport == "streamable_http":
+        if transport == "streamable_http":
             url = settings.get("url")
             if not url:
                 print(f"⚠️  Skipping '{server_name}': no URL provided.")
@@ -86,13 +81,16 @@ def load_mcp_config():
             url = settings.get("url")
             api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
             prefix = settings.get("prefix", "")
-            if not url or not api_key:
-                print(f"⚠️  Skipping SSE server '{server_name}': URL or API key missing.")
+            
+            # FIXED: We only skip if URL is missing. We DO NOT care if api_key is missing!
+            if not url:
+                print(f"⚠️  Skipping SSE server '{server_name}': URL missing.")
                 continue
+                
             servers[server_name] = {
                 "_transport": "sse_direct",
                 "url": url,
-                "api_key": api_key,
+                "api_key": api_key, # Can be None now!
                 "prefix": prefix,
             }
             print(f"🌉 SSE direct registered: {server_name} → {url}")
@@ -144,7 +142,7 @@ def load_mcp_config():
 
 
 # ---------------------------------------------------------------------------
-# Pydantic model builder (shared by SSE and fastmcp_http paths)
+# Pydantic model builder
 # ---------------------------------------------------------------------------
 
 def _make_tool_input_model(tool_name: str, schema: dict):
@@ -171,69 +169,23 @@ def _make_tool_input_model(tool_name: str, schema: dict):
 
 
 # ---------------------------------------------------------------------------
-# fastmcp_http: use fastmcp.Client directly (same library as app.py)
-# ---------------------------------------------------------------------------
-
-async def get_fastmcp_tools(server_name: str, url: str, timeout: float = 30.0) -> list:
-    """
-    Discover tools from a FastMCP HTTP server using fastmcp.Client,
-    then wrap each as a LangChain StructuredTool with an async executor.
-    """
-    print(f"   🔍 Listing tools from FastMCP server at {url} ...")
-
-    # Discover tools — open a short-lived session
-    async with FastMCPClient(url) as client:
-        raw_tools = await client.list_tools()
-
-    print(f"   📋 Discovered {len(raw_tools)} tools: {[t.name for t in raw_tools]}")
-
-    lc_tools = []
-    for t in raw_tools:
-        name        = t.name
-        desc        = t.description or ""
-        schema      = t.inputSchema or {}
-        input_model = _make_tool_input_model(name, schema)
-
-        # Capture per-tool closure variables
-        _url   = url
-        _tname = name
-
-        async def _arun(_n=_tname, _u=_url, **kwargs):
-            """Call the tool on the remote FastMCP server."""
-            async with FastMCPClient(_u) as c:
-                result = await c.call_tool(_n, kwargs)
-            # result is a list of TextContent / ImageContent etc.
-            parts = []
-            for item in result:
-                if hasattr(item, "text"):
-                    parts.append(item.text)
-                elif hasattr(item, "data"):
-                    parts.append(str(item.data))
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts) if parts else "(no content returned)"
-
-        lc_tools.append(StructuredTool(
-            name=name,
-            description=desc,
-            args_schema=input_model,
-            coroutine=_arun,
-        ))
-
-    return lc_tools
-
-
-# ---------------------------------------------------------------------------
-# In-process SSE client (legacy — unchanged)
+# In-process SSE client
 # ---------------------------------------------------------------------------
 
 async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
-    sse_hdrs  = {"x-api-key": api_key, "Accept": "text/event-stream", "Cache-Control": "no-store"}
-    post_hdrs = {"x-api-key": api_key, "Content-Type": "application/json"}
+    sse_hdrs  = {"Accept": "text/event-stream", "Cache-Control": "no-store"}
+    post_hdrs = {"Content-Type": "application/json"}
+    
+    # FIXED: Only add the API key headers if an API key was actually provided
+    if api_key:
+        sse_hdrs["x-api-key"] = api_key
+        post_hdrs["x-api-key"] = api_key
+        
     q     = asyncio.Queue()
     ready = asyncio.Event()
     purl  = [None]
 
+    # verify=False handles your SSL bypass!
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
 
         async def _sse_reader():
@@ -280,7 +232,6 @@ async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
             except asyncio.CancelledError:
                 pass
 
-
 async def get_sse_tools_direct(server_name, sse_url, api_key, prefix="", timeout=30.0):
     raw      = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
     tool_defs = raw.get("tools", [])
@@ -319,18 +270,12 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
             print(f"🔌 Connecting to '{server_name}'...")
             transport = server_config.get("_transport") or server_config.get("transport")
 
-            if transport == "fastmcp_http":
-                tools = await asyncio.wait_for(
-                    get_fastmcp_tools(server_name, server_config["url"]),
-                    timeout=60.0,
-                )
-
-            elif transport == "sse_direct":
+            if transport == "sse_direct":
                 tools = await asyncio.wait_for(
                     get_sse_tools_direct(
                         server_name,
                         server_config["url"],
-                        server_config["api_key"],
+                        server_config.get("api_key"),
                         server_config.get("prefix", ""),
                     ),
                     timeout=30.0,
@@ -382,17 +327,13 @@ async def lifespan(app: FastAPI):
     finally:
         print("🔌 Shutting down...")
 
-
 app = FastAPI(lifespan=lifespan)
-
 
 class QueryRequest(BaseModel):
     prompt: str
     thread_id: str = "default_thread"
 
-
 memory = MemorySaver()
-
 
 @app.post("/chat")
 async def chat_endpoint(request: QueryRequest):
@@ -436,7 +377,6 @@ async def chat_endpoint(request: QueryRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/tools")
 async def list_tools():
     return {
@@ -444,11 +384,9 @@ async def list_tools():
         "failed_servers": failed_servers,
     }
 
-
 def start_gateway(host="0.0.0.0", port=8010):
     print(f"🚀 Starting MCP Gateway on {host}:{port}...")
     uvicorn.run(app, host=host, port=port)
-
 
 if __name__ == "__main__":
     start_gateway()
