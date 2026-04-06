@@ -10,8 +10,34 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
 import ssl
-
 import httpx
+
+# ==============================================================================
+# THE ULTIMATE SSL BYPASS (Corporate VPN/Proxy Fix)
+# ==============================================================================
+os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Monkeypatch HTTPX to ALWAYS disable SSL verification globally!
+# This fixes the MCP SDK "unhandled errors in a TaskGroup" caused by SSL drops.
+_original_async_client_init = httpx.AsyncClient.__init__
+_original_client_init = httpx.Client.__init__
+
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs['verify'] = False
+    _original_async_client_init(self, *args, **kwargs)
+
+def _patched_client_init(self, *args, **kwargs):
+    kwargs['verify'] = False
+    _original_client_init(self, *args, **kwargs)
+
+httpx.AsyncClient.__init__ = _patched_async_client_init
+httpx.Client.__init__ = _patched_client_init
+# ==============================================================================
+
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -21,14 +47,6 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import Field, create_model
 from typing import Any
 from urllib.parse import urlparse as _urlparse
-
-# --- SSL Bypass for corporate networks ---
-os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
-os.environ['PYTHONHTTPSVERIFY'] = '0'
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-ssl._create_default_https_context = ssl._create_unverified_context
-# -----------------------------------------
 
 load_dotenv()
 
@@ -60,40 +78,44 @@ def load_mcp_config():
     for server_name, settings in config_data.items():
         transport = settings.get("transport", "stdio")
 
-        # ── STREAMABLE HTTP (MultiServerMCPClient native) ─────────────────
-        if transport == "streamable_http":
+        # ── NATIVE MCP HTTP/SSE (Handled natively by LangChain) ───────────
+        if transport in ["streamable_http", "fastmcp_http", "mcp_http"]:
             url = settings.get("url")
             if not url:
-                print(f"⚠️  Skipping '{server_name}': no URL provided.")
                 continue
-            server_cfg = {"transport": "streamable_http", "url": url}
+            
+            # FastMCP servers expose SSE at /sse. If you forgot it, we append it automatically.
+            if not url.endswith("/sse"):
+                url = url.rstrip("/") + "/sse"
+                
+            server_cfg = {"transport": "sse", "url": url}
+            
             headers = settings.get("headers", {})
             api_key = settings.get("api_key")
             if api_key:
                 headers["x-api-key"] = api_key
             if headers:
                 server_cfg["headers"] = headers
+                
             servers[server_name] = server_cfg
-            print(f"🌐 streamable_http registered: {server_name} → {url}")
+            print(f"🌐 Native MCP Remote registered: {server_name} → {url}")
 
-        # ── SSE (legacy, in-process bridge) ──────────────────────────────
+        # ── LEGACY CUSTOM SSE (With Prefix Support) ───────────────────────
         elif transport == "sse":
             url = settings.get("url")
             api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
             prefix = settings.get("prefix", "")
             
-            # FIXED: We only skip if URL is missing. We DO NOT care if api_key is missing!
             if not url:
-                print(f"⚠️  Skipping SSE server '{server_name}': URL missing.")
                 continue
                 
             servers[server_name] = {
-                "_transport": "sse_direct",
+                "_transport": "sse_legacy",
                 "url": url,
-                "api_key": api_key, # Can be None now!
+                "api_key": api_key, # None is OK!
                 "prefix": prefix,
             }
-            print(f"🌉 SSE direct registered: {server_name} → {url}")
+            print(f"🌉 Legacy SSE registered: {server_name} → {url}")
 
         # ── STDIO ─────────────────────────────────────────────────────────
         elif transport == "stdio":
@@ -135,9 +157,6 @@ def load_mcp_config():
                 }
                 print(f"🖥️  stdio registered: {server_name} → {script_abs_path}")
 
-        else:
-            print(f"⚠️  Unknown transport '{transport}' for '{server_name}' — skipping.")
-
     return servers
 
 
@@ -169,14 +188,13 @@ def _make_tool_input_model(tool_name: str, schema: dict):
 
 
 # ---------------------------------------------------------------------------
-# In-process SSE client
+# In-process SSE client (Legacy)
 # ---------------------------------------------------------------------------
 
 async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
     sse_hdrs  = {"Accept": "text/event-stream", "Cache-Control": "no-store"}
     post_hdrs = {"Content-Type": "application/json"}
     
-    # FIXED: Only add the API key headers if an API key was actually provided
     if api_key:
         sse_hdrs["x-api-key"] = api_key
         post_hdrs["x-api-key"] = api_key
@@ -185,8 +203,7 @@ async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
     ready = asyncio.Event()
     purl  = [None]
 
-    # verify=False handles your SSL bypass!
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as http:
 
         async def _sse_reader():
             async with http.stream("GET", sse_url, headers=sse_hdrs) as resp:
@@ -270,7 +287,7 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
             print(f"🔌 Connecting to '{server_name}'...")
             transport = server_config.get("_transport") or server_config.get("transport")
 
-            if transport == "sse_direct":
+            if transport == "sse_legacy":
                 tools = await asyncio.wait_for(
                     get_sse_tools_direct(
                         server_name,
@@ -280,9 +297,8 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
                     ),
                     timeout=30.0,
                 )
-
             else:
-                # streamable_http or stdio — MultiServerMCPClient handles both
+                # Native Langchain MultiServerMCPClient handles "sse" seamlessly 
                 client = MultiServerMCPClient({server_name: server_config})
                 tools  = await asyncio.wait_for(client.get_tools(), timeout=60.0)
 
