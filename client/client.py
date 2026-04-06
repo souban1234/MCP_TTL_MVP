@@ -46,7 +46,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from pydantic import Field, create_model
 from typing import Any
-from urllib.parse import urlparse as _urlparse
+from urllib.parse import urlparse as _urlparse, urljoin
 
 load_dotenv()
 
@@ -214,10 +214,14 @@ async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
                     if ln.startswith("data:"):
                         data = ln[5:].strip()
                         if purl[0] is None:
-                            path = (prefix + data) if prefix and not data.startswith(prefix) else data
-                            p = _urlparse(sse_url)
-                            purl[0] = f"{p.scheme}://{p.netloc}{path}"
+                            raw_path = (prefix + data) if prefix and not data.startswith(prefix) else data
+                            purl[0] = urljoin(sse_url, raw_path)
                             ready.set()
+                        # if purl[0] is None:
+                        #     path = (prefix + data) if prefix and not data.startswith(prefix) else data
+                        #     p = _urlparse(sse_url)
+                        #     purl[0] = f"{p.scheme}://{p.netloc}{path}"
+                        #     ready.set()
                         else:
                             try:
                                 await q.put(json.loads(data))
