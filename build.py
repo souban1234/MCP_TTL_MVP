@@ -100,6 +100,11 @@ def main():
                 "url": "https://chromosome.tatatechnologies.com/agentbuilder-api/api/v1/mcp/project/f6c70ae9-ae3a-4be1-97c4-631e773eac5b/sse",
                 "api_key": "sk-X-R9VlE6FJL0E16KRu1Sp1Edisi2KmSR6luTM5gcCRc",
                 "prefix": "/agentbuilder-api"
+            },
+            "my-local-fastmcp": {
+                "transport": "sse",
+                "url": "http://127.0.0.1:8001/sse",
+                "prefix": ""
             }
         }
     }
