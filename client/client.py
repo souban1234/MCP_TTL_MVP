@@ -34,6 +34,44 @@ else:
     project_root = os.path.abspath(os.path.join(client_dir, ".."))
 
 
+def _resolve_placeholder(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    if value.startswith("${") and value.endswith("}"):
+        return os.getenv(value[2:-1], "")
+
+    if value.startswith("env:"):
+        return os.getenv(value[4:], "")
+
+    return value
+
+
+def _resolve_headers(settings: dict) -> dict:
+    headers = settings.get("headers", {}) or {}
+    resolved_headers = {
+        key: _resolve_placeholder(val)
+        for key, val in headers.items()
+    }
+
+    api_key = _resolve_placeholder(settings.get("api_key"))
+    if api_key:
+        resolved_headers.setdefault("x-api-key", api_key)
+
+    return {
+        key: val
+        for key, val in resolved_headers.items()
+        if val not in (None, "")
+    }
+
+
+def _normalize_transport(value: str) -> str:
+    transport = str(value or "stdio").strip().lower().replace("-", "_")
+    if transport == "streamablehttp":
+        return "streamable_http"
+    return transport
+
+
 def load_mcp_config():
     config_path = os.path.join(project_root, "config.json")
     if not os.path.exists(config_path):
@@ -48,14 +86,17 @@ def load_mcp_config():
 
     servers = {}
     for server_name, settings in config_data.items():
-        transport = settings.get("transport", "stdio")
+        transport = _normalize_transport(settings.get("transport", "stdio"))
 
         if transport == "sse":
-            url = settings.get("url")
-            api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
-            prefix = settings.get("prefix", "")
+            url = _resolve_placeholder(settings.get("url"))
+            headers = _resolve_headers(settings)
+            api_key = _resolve_placeholder(
+                settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
+            )
+            prefix = _resolve_placeholder(settings.get("prefix", ""))
 
-            if not url or not api_key:
+            if not url:
                 print(f"⚠️ Skipping SSE server '{server_name}': URL or API key missing.")
                 continue
 
@@ -81,6 +122,23 @@ def load_mcp_config():
                 "prefix": prefix,
             }
             print(f"🌉 SSE direct registered: {server_name} → {url}")
+        elif transport in {"http", "streamable_http"}:
+            url = _resolve_placeholder(settings.get("url"))
+            headers = _resolve_headers(settings)
+
+            if not url:
+                print(f"Skipping HTTP server '{server_name}': URL missing.")
+                continue
+
+            server_config = {
+                "transport": "http",
+                "url": url,
+            }
+            if headers:
+                server_config["headers"] = headers
+
+            servers[server_name] = server_config
+            print(f"HTTP MCP registered: {server_name} -> {url}")
         elif transport == "stdio":
             custom_command = settings.get("command")
             custom_args = settings.get("args", [])
