@@ -1,4 +1,4 @@
-# client/client.py
+# client/client.py - UPDATED VERSION WITH TATA TECHNOLOGIES INTEGRATION
 import sys
 import os
 import json
@@ -9,47 +9,21 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
-import ssl
+
 import httpx
-
-# ==============================================================================
-# THE ULTIMATE SSL BYPASS (Corporate VPN/Proxy Fix)
-# ==============================================================================
-os.environ['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
-os.environ['PYTHONHTTPSVERIFY'] = '0'
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# Monkeypatch HTTPX to ALWAYS disable SSL verification globally!
-# This fixes the MCP SDK "unhandled errors in a TaskGroup" caused by SSL drops.
-_original_async_client_init = httpx.AsyncClient.__init__
-_original_client_init = httpx.Client.__init__
-
-def _patched_async_client_init(self, *args, **kwargs):
-    kwargs['verify'] = False
-    _original_async_client_init(self, *args, **kwargs)
-
-def _patched_client_init(self, *args, **kwargs):
-    kwargs['verify'] = False
-    _original_client_init(self, *args, **kwargs)
-
-httpx.AsyncClient.__init__ = _patched_async_client_init
-httpx.Client.__init__ = _patched_client_init
-# ==============================================================================
-
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from pydantic import Field, create_model
 from typing import Any
-from urllib.parse import urlparse as _urlparse, urljoin
+from urllib.parse import urlparse as _urlparse
 
 load_dotenv()
 
+# Project root resolution
 if getattr(sys, 'frozen', False):
     project_root = os.path.dirname(sys.executable)
 else:
@@ -57,11 +31,9 @@ else:
     client_dir = os.path.dirname(current_script_path)
     project_root = os.path.abspath(os.path.join(client_dir, ".."))
 
-# ---------------------------------------------------------------------------
-# Config loader
-# ---------------------------------------------------------------------------
 
 def load_mcp_config():
+    """Load MCP configuration from config.json"""
     config_path = os.path.join(project_root, "config.json")
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at: {config_path}")
@@ -74,50 +46,26 @@ def load_mcp_config():
         config_data = config_data["mcpServers"]
 
     servers = {}
-
     for server_name, settings in config_data.items():
         transport = settings.get("transport", "stdio")
 
-        # ── NATIVE MCP HTTP/SSE (Handled natively by LangChain) ───────────
-        if transport in ["streamable_http", "fastmcp_http", "mcp_http"]:
-            url = settings.get("url")
-            if not url:
-                continue
-            
-            # FastMCP servers expose SSE at /sse. If you forgot it, we append it automatically.
-            if not url.endswith("/sse"):
-                url = url.rstrip("/") + "/sse"
-                
-            server_cfg = {"transport": "sse", "url": url}
-            
-            headers = settings.get("headers", {})
-            api_key = settings.get("api_key")
-            if api_key:
-                headers["x-api-key"] = api_key
-            if headers:
-                server_cfg["headers"] = headers
-                
-            servers[server_name] = server_cfg
-            print(f"🌐 Native MCP Remote registered: {server_name} → {url}")
-
-        # ── LEGACY CUSTOM SSE (With Prefix Support) ───────────────────────
-        elif transport == "sse":
+        if transport == "sse":
             url = settings.get("url")
             api_key = settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
             prefix = settings.get("prefix", "")
-            
-            if not url:
+
+            if not url or not api_key:
+                print(f"⚠️ Skipping SSE server '{server_name}': URL or API key missing.")
                 continue
-                
+
             servers[server_name] = {
-                "_transport": "sse_legacy",
+                "_transport": "sse_direct",
                 "url": url,
-                "api_key": api_key, # None is OK!
+                "api_key": api_key,
                 "prefix": prefix,
             }
-            print(f"🌉 Legacy SSE registered: {server_name} → {url}")
-
-        # ── STDIO ─────────────────────────────────────────────────────────
+            print(f"🌉 SSE direct registered: {server_name} → {url}")
+            
         elif transport == "stdio":
             custom_command = settings.get("command")
             custom_args = settings.get("args", [])
@@ -128,23 +76,26 @@ def load_mcp_config():
 
             if custom_command:
                 executable = custom_command
-                if custom_command in ("python", "python3"):
+                if custom_command == "python" or custom_command == "python3":
                     executable = sys.executable
+                
                 if not os.path.isabs(executable) and not executable.startswith(("uvx", "npx")):
-                    candidate = os.path.abspath(os.path.join(project_root, executable))
-                    if os.path.exists(candidate):
-                        executable = candidate
-                    elif os.path.exists(candidate + ".exe"):
-                        executable = candidate + ".exe"
-                server_cfg = {
+                    candidate_path = os.path.abspath(os.path.join(project_root, executable))
+                    if os.path.exists(candidate_path):
+                        executable = candidate_path
+                    elif os.path.exists(candidate_path + ".exe"):
+                        executable = candidate_path + ".exe"
+                
+                server_config = {
                     "transport": "stdio",
                     "command": executable,
                     "args": custom_args,
                 }
                 if full_env:
-                    server_cfg["env"] = full_env
-                servers[server_name] = server_cfg
-                print(f"🔧 stdio registered: {server_name} → {executable}")
+                    server_config["env"] = full_env
+
+                servers[server_name] = server_config
+                print(f"🔧 stdio (custom cmd) registered: {server_name} → {executable}")
             else:
                 script_rel_path = settings.get("script_path")
                 if not script_rel_path:
@@ -155,19 +106,121 @@ def load_mcp_config():
                     "command": sys.executable,
                     "args": [script_abs_path],
                 }
-                print(f"🖥️  stdio registered: {server_name} → {script_abs_path}")
+                print(f"🖥️ stdio server registered: {server_name} → {script_abs_path}")
 
     return servers
 
 
-# ---------------------------------------------------------------------------
-# Pydantic model builder
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SSE MCP CLIENT - FIXED VERSION FOR TATA TECHNOLOGIES SERVER
+# ============================================================================
+
+async def _sse_rpc(sse_url: str, api_key: str, prefix: str,
+                   method: str, params: dict, timeout: float = 30.0) -> dict:
+    """
+    Execute ONE MCP method via SSE transport.
+    
+    Args:
+        sse_url: SSE endpoint URL
+        api_key: Authentication API key
+        prefix: Path prefix for discovered POST URL
+        method: MCP method name (e.g., 'tools/list')
+        params: MCP method parameters
+        timeout: Request timeout in seconds
+    
+    Returns:
+        MCP result dictionary
+    """
+    sse_hdrs = {
+        "x-api-key": api_key,
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-store"
+    }
+    post_hdrs = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    q: asyncio.Queue = asyncio.Queue()
+    ready = asyncio.Event()
+    purl: list = [None]
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
+
+        async def _sse_reader():
+            """Read SSE stream to discover POST endpoint"""
+            async with http.stream("GET", sse_url, headers=sse_hdrs) as resp:
+                resp.raise_for_status()
+                async for ln in resp.aiter_lines():
+                    if not ln or ln.startswith(":") or ln.startswith("event:"):
+                        continue
+                    if ln.startswith("data:"):
+                        data = ln[5:].strip()
+                        if purl[0] is None:
+                            # ✅ FIXED: Handle prefix correctly
+                            if prefix and data and not data.startswith(prefix):
+                                path = prefix + data
+                            else:
+                                path = data
+                            p = _urlparse(sse_url)
+                            purl[0] = f"{p.scheme}://{p.netloc}{path}"
+                            print(f"   ✅ POST endpoint discovered: {purl[0]}")
+                            ready.set()
+                        else:
+                            try:
+                                await q.put(json.loads(data))
+                            except Exception:
+                                pass
+
+        sse_task = asyncio.ensure_future(_sse_reader())
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+            url = purl[0]
+
+            # MCP initialize handshake
+            print(f"   🤝 Initializing MCP protocol...")
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-gateway", "version": "1.0"}
+                }
+            })
+            await asyncio.wait_for(q.get(), timeout=timeout)
+            print(f"   ✅ MCP initialized")
+
+            # Notification: initialized
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            })
+
+            # Call the actual method
+            print(f"   📞 Calling: {method}")
+            await http.post(url, headers=post_hdrs, json={
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            })
+            
+            result_msg = await asyncio.wait_for(q.get(), timeout=timeout)
+            print(f"   ✅ Method '{method}' completed")
+            return result_msg.get("result", {})
+            
+        finally:
+            sse_task.cancel()
+            try:
+                await sse_task
+            except asyncio.CancelledError:
+                pass
+
 
 def _make_tool_input_model(tool_name: str, schema: dict):
+    """Build a Pydantic model from an MCP tool's inputSchema"""
     properties = schema.get("properties", {})
     required_fields = schema.get("required", [])
     fields: dict = {}
+    
     for pname, pschema in properties.items():
         ptype_str = pschema.get("type", "string")
         ptype: Any = str
@@ -179,138 +232,123 @@ def _make_tool_input_model(tool_name: str, schema: dict):
             ptype = list
         elif ptype_str == "object":
             ptype = dict
+        
         default = ... if pname in required_fields else None
         desc = pschema.get("description", pname)
         fields[pname] = (ptype, Field(default, description=desc))
+    
     if not fields:
         return type("EmptyInput", (object,), {"__annotations__": {}})
+    
     return create_model(f"{tool_name}Input", **fields)
 
 
-# ---------------------------------------------------------------------------
-# In-process SSE client (Legacy)
-# ---------------------------------------------------------------------------
-
-async def _sse_rpc(sse_url, api_key, prefix, method, params, timeout=30.0):
-    sse_hdrs  = {"Accept": "text/event-stream", "Cache-Control": "no-store"}
-    post_hdrs = {"Content-Type": "application/json"}
+async def get_sse_tools_direct(server_name: str, sse_url: str, api_key: str,
+                                prefix: str = "", timeout: float = 30.0) -> list:
+    """
+    ✅ MAIN FUNCTION: Discover and wrap tools from Tata Technologies MCP server.
     
-    if api_key:
-        sse_hdrs["x-api-key"] = api_key
-        post_hdrs["x-api-key"] = api_key
-        
-    q     = asyncio.Queue()
-    ready = asyncio.Event()
-    purl  = [None]
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as http:
-
-        async def _sse_reader():
-            async with http.stream("GET", sse_url, headers=sse_hdrs) as resp:
-                resp.raise_for_status()
-                async for ln in resp.aiter_lines():
-                    if not ln or ln.startswith(":") or ln.startswith("event:"):
-                        continue
-                    if ln.startswith("data:"):
-                        data = ln[5:].strip()
-                        if purl[0] is None:
-                            raw_path = (prefix + data) if prefix and not data.startswith(prefix) else data
-                            purl[0] = urljoin(sse_url, raw_path)
-                            ready.set()
-                        # if purl[0] is None:
-                        #     path = (prefix + data) if prefix and not data.startswith(prefix) else data
-                        #     p = _urlparse(sse_url)
-                        #     purl[0] = f"{p.scheme}://{p.netloc}{path}"
-                        #     ready.set()
-                        else:
-                            try:
-                                await q.put(json.loads(data))
-                            except Exception:
-                                pass
-
-        sse_task = asyncio.ensure_future(_sse_reader())
-        try:
-            await asyncio.wait_for(ready.wait(), timeout=timeout)
-            url = purl[0]
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0", "id": 0, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                           "clientInfo": {"name": "mcp-gateway", "version": "1.0"}}
-            })
-            await asyncio.wait_for(q.get(), timeout=timeout)
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
-            })
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-            })
-            result_msg = await asyncio.wait_for(q.get(), timeout=timeout)
-            return result_msg.get("result", {})
-        finally:
-            sse_task.cancel()
-            try:
-                await sse_task
-            except asyncio.CancelledError:
-                pass
-
-async def get_sse_tools_direct(server_name, sse_url, api_key, prefix="", timeout=30.0):
-    raw      = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
+    This function:
+    1. Connects to the SSE endpoint
+    2. Discovers available tools
+    3. Wraps each tool as a LangChain StructuredTool
+    4. Returns ready-to-use tools for the LLM agent
+    
+    Args:
+        server_name: Display name of the server
+        sse_url: SSE endpoint (e.g., https://chromosome.tatatechnologies.com/mcp-server/mcp)
+        api_key: Authentication API key
+        prefix: Path prefix for POST endpoint (usually empty for direct URLs)
+        timeout: Timeout in seconds
+    
+    Returns:
+        List of LangChain StructuredTool objects
+    """
+    print(f"\n🔍 Discovering tools from {server_name}...")
+    print(f"   Server URL: {sse_url}")
+    print(f"   Prefix: '{prefix if prefix else '(none)'}'")
+    
+    # Step 1: Call tools/list to get available tools
+    try:
+        raw = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
+    except Exception as e:
+        print(f"   ❌ Failed to list tools: {e}")
+        raise
+    
     tool_defs = raw.get("tools", [])
-    lc_tools  = []
+    print(f"   ✅ Discovered {len(tool_defs)} tools")
+    
+    # Step 2: Create StructuredTool for each discovered tool
+    lc_tools = []
+    
     for t in tool_defs:
-        name        = t["name"]
-        desc        = t.get("description", "")
-        schema      = t.get("inputSchema", {})
+        name = t["name"]
+        desc = t.get("description", "")
+        schema = t.get("inputSchema", {})
         input_model = _make_tool_input_model(name, schema)
+        
+        print(f"      • {name}: {desc[:60]}...")
+        
+        # Capture closure variables explicitly
         _url, _key, _pfx, _tname = sse_url, api_key, prefix, name
 
         async def _arun(_n=_tname, _u=_url, _k=_key, _p=_pfx, **kwargs):
-            result  = await _sse_rpc(_u, _k, _p, "tools/call",
-                                     {"name": _n, "arguments": kwargs}, timeout=60.0)
-            content = result.get("content", [])
-            parts   = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
-            return "\n".join(parts) if parts else str(result)
+            """Async execution of the tool"""
+            try:
+                result = await _sse_rpc(_u, _k, _p, "tools/call",
+                                        {"name": _n, "arguments": kwargs}, timeout=60.0)
+                content = result.get("content", [])
+                parts = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
+                return "\n".join(parts) if parts else str(result)
+            except Exception as e:
+                return f"Error calling tool {_n}: {str(e)}"
 
         lc_tools.append(StructuredTool(
-            name=name, description=desc,
-            args_schema=input_model, coroutine=_arun,
+            name=name,
+            description=desc,
+            args_schema=input_model,
+            coroutine=_arun,
         ))
+
+    print(f"   ✅ Wrapped {len(lc_tools)} tools for LLM")
     return lc_tools
 
 
-# ---------------------------------------------------------------------------
-# Unified tool discovery
-# ---------------------------------------------------------------------------
-
 async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
-    all_tools      = []
+    """
+    Safely connect to all configured servers and load their tools.
+    
+    Returns:
+        (all_tools: list, failed_servers: list)
+    """
+    all_tools = []
     failed_servers = []
 
     for server_name, server_config in all_servers.items():
         try:
-            print(f"🔌 Connecting to '{server_name}'...")
-            transport = server_config.get("_transport") or server_config.get("transport")
+            print(f"\n🔌 Connecting to '{server_name}'...")
 
-            if transport == "sse_legacy":
+            if server_config.get("_transport") == "sse_direct":
+                # ✅ TATA TECHNOLOGIES: Use in-process SSE client
                 tools = await asyncio.wait_for(
                     get_sse_tools_direct(
                         server_name,
                         server_config["url"],
-                        server_config.get("api_key"),
+                        server_config["api_key"],
                         server_config.get("prefix", ""),
                     ),
-                    timeout=30.0,
+                    timeout=60.0,
                 )
             else:
-                # Native Langchain MultiServerMCPClient handles "sse" seamlessly 
+                # Standard stdio transport
                 client = MultiServerMCPClient({server_name: server_config})
-                tools  = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+                tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
 
             all_tools.extend(tools)
             print(f"✅ Loaded {len(tools)} tools from '{server_name}'")
-
+            
         except asyncio.TimeoutError:
-            print(f"⏱️  Timeout connecting to '{server_name}' — skipping.")
+            print(f"⏱️ Timeout connecting to '{server_name}' — skipping.")
             failed_servers.append(server_name)
         except Exception as e:
             print(f"❌ Failed to load tools from '{server_name}': {e}")
@@ -320,93 +358,249 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
     return all_tools, failed_servers
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FASTAPI APPLICATION
+# ============================================================================
 
-mcp_servers    = {}
-cached_tools   = []
+mcp_servers = {}
+cached_tools = []
 failed_servers = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """FastAPI lifespan handler - runs at startup and shutdown"""
     global mcp_servers, cached_tools, failed_servers
     try:
+        print("\n" + "="*70)
+        print("🚀 STARTUP: MCP Gateway Initialization")
+        print("="*70)
+        
         mcp_servers = load_mcp_config()
-        print(f"🔌 Servers configured: {list(mcp_servers.keys())}")
-        print("🔍 Initializing MCP tools...")
+        print(f"\n📊 Servers configured: {list(mcp_servers.keys())}")
+        
+        # Discover and cache tools at startup
+        print(f"\n🔍 Initializing MCP tools...")
         cached_tools, failed_servers = await get_tools_safe(mcp_servers)
+        
         if failed_servers:
-            print(f"⚠️  Some servers failed at startup: {failed_servers}")
-        print(f"✅ Startup complete. {len(cached_tools)} tools cached.")
+            print(f"\n⚠️ Failed servers: {failed_servers}")
+        
+        print(f"\n✅ Startup complete.")
+        print(f"   Total tools: {len(cached_tools)}")
+        print(f"   Tool names: {[t.name for t in cached_tools]}")
+        print("="*70 + "\n")
+        
         yield
     except Exception as e:
         print(f"❌ Error during startup: {e}")
+        traceback.print_exc()
         raise
     finally:
-        print("🔌 Shutting down...")
+        print("\n🔌 Shutting down MCP Gateway...")
+
 
 app = FastAPI(lifespan=lifespan)
+
 
 class QueryRequest(BaseModel):
     prompt: str
     thread_id: str = "default_thread"
 
+
+# Initialize in-memory checkpointer for conversation history
 memory = MemorySaver()
+
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
 
 @app.post("/chat")
 async def chat_endpoint(request: QueryRequest):
+    """
+    ✅ MAIN CHAT ENDPOINT
+    
+    Processes user query by:
+    1. Checking available tools
+    2. Creating LLM agent
+    3. Agent calls tools as needed
+    4. Returns final response
+    """
     global mcp_servers, cached_tools, failed_servers
 
     if not mcp_servers:
         raise HTTPException(status_code=500, detail="No MCP servers configured")
 
     try:
-        tools  = cached_tools
+        tools = cached_tools
         failed = failed_servers
 
         if not tools:
-            raise HTTPException(
-                status_code=503,
-                detail=f"No tools available. Failed servers: {failed}"
-            )
+            if failed:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"No tools available. Failed servers: {', '.join(failed)}"
+                )
+            else:
+                raise HTTPException(status_code=503, detail="No tools available.")
 
+        print(f"\n📊 Chat Request Received")
+        print(f"   Prompt: {request.prompt[:80]}...")
+        print(f"   Available tools: {len(tools)}")
+        print(f"   Tool names: {[t.name for t in tools]}")
+
+        # Initialize LLM
         llm = AzureChatOpenAI(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME")
         )
 
-        agent  = create_react_agent(llm, tools, checkpointer=memory)
+        # Create agent with conversation memory
+        agent = create_react_agent(llm, tools, checkpointer=memory)
+        
+        # Configure thread for multi-turn conversation
         config = {"configurable": {"thread_id": request.thread_id}}
+        
+        # Invoke the agent
+        print(f"🤖 Invoking agent...")
         inputs = {"messages": [HumanMessage(content=request.prompt)]}
         result = await agent.ainvoke(inputs, config=config)
-
-        result_content = result["messages"][-1].content
+        
+        # Extract final response
+        final_message = result["messages"][-1]
+        result_content = final_message.content
+        
+        print(f"✅ Agent completed successfully")
+        
         if failed:
-            result_content += f"\n\n⚠️ Note: These servers were unavailable: {failed}"
-
-        return {"response": result_content}
+            result_content += f"\n\n⚠️ Note: Some servers were unavailable: {', '.join(failed)}"
+            
+        return {
+            "response": result_content,
+            "tools_available": len(tools),
+            "failed_servers": failed
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        print("❌ Exception in chat_endpoint:")
+        print(f"\n❌ Exception in chat_endpoint: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 
 @app.get("/tools")
 async def list_tools():
+    """Get list of all available tools"""
     return {
-        "loaded": [t.name for t in cached_tools],
-        "failed_servers": failed_servers,
+        "total": len(cached_tools),
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description or "No description"
+            }
+            for t in cached_tools
+        ],
+        "failed_servers": failed_servers
     }
 
+
+@app.get("/servers/status")
+async def servers_status():
+    """Get status of all configured servers and their tools"""
+    global mcp_servers, cached_tools, failed_servers
+    
+    return {
+        "total_servers": len(mcp_servers),
+        "configured_servers": list(mcp_servers.keys()),
+        "tools_loaded": len(cached_tools),
+        "failed_servers": failed_servers,
+        "tools": [
+            {
+                "name": t.name,
+                "description": (t.description or "")[:100]
+            }
+            for t in cached_tools
+        ]
+    }
+
+
+@app.post("/tools/call")
+async def call_tool_directly(tool_name: str, tool_args: dict):
+    """
+    Directly call a specific tool without using the agent.
+    
+    Useful for testing tools or direct integration.
+    """
+    global cached_tools
+    
+    try:
+        tool = next((t for t in cached_tools if t.name == tool_name), None)
+        if not tool:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Tool '{tool_name}' not found. Available: {[t.name for t in cached_tools]}"
+            )
+        
+        print(f"\n📞 Directly calling tool: {tool_name}")
+        print(f"    Args: {tool_args}")
+        
+        # Call the tool coroutine
+        result = await tool.coroutine(**tool_args)
+        
+        print(f"✅ Tool result: {result[:100]}...")
+        
+        return {
+            "tool": tool_name,
+            "result": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/reconnect")
+async def reconnect_servers():
+    """
+    Reconnect to all configured servers.
+    
+    Useful if servers go down and come back online.
+    """
+    global mcp_servers, cached_tools, failed_servers
+    
+    try:
+        print("\n🔄 Reconnecting to all servers...")
+        cached_tools, failed_servers = await get_tools_safe(mcp_servers)
+        
+        return {
+            "status": "reconnected",
+            "tools_loaded": len(cached_tools),
+            "failed_servers": failed_servers
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "servers_configured": len(mcp_servers),
+        "tools_loaded": len(cached_tools)
+    }
+
+
 def start_gateway(host="0.0.0.0", port=8010):
-    print(f"🚀 Starting MCP Gateway on {host}:{port}...")
-    uvicorn.run(app, host=host, port=port)
+    """Start the FastAPI gateway server"""
+    print(f"\n🚀 Starting MCP Gateway on {host}:{port}...")
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
 
 if __name__ == "__main__":
     start_gateway()
