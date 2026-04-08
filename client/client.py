@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
 
+from dataclasses import asdict, is_dataclass
 import httpx
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
@@ -277,8 +278,84 @@ def _make_tool_input_model(tool_name: str, schema: dict):
     return create_model(f"{tool_name}Input", **fields)
 
 
+# ---------------------------------------------------------------------------
+# JSON Normalization Helpers
+# ---------------------------------------------------------------------------
+
+def _make_json_safe(value):
+    if hasattr(value, "model_dump"):
+        return _make_json_safe(value.model_dump())
+    if is_dataclass(value):
+        return _make_json_safe(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(item) for item in value]
+    return value
+
+def _parse_json_text(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return value
+    return _make_json_safe(parsed)
+
+def _normalize_tool_result(result):
+    # 1. Handle object with .data
+    if hasattr(result, "data"):
+        data = getattr(result, "data", None)
+        if data is not None:
+            if isinstance(data, str):
+                return _parse_json_text(data)
+            return _make_json_safe(data)
+
+    # 2. Handle object with structured_content
+    if hasattr(result, "structured_content") or hasattr(result, "structuredContent"):
+        structured_content = getattr(result, "structured_content", None) or getattr(result, "structuredContent", None)
+        if structured_content is not None:
+            if isinstance(structured_content, dict) and set(structured_content.keys()) == {"result"}:
+                return _make_json_safe(structured_content["result"])
+            return _make_json_safe(structured_content)
+
+    # 3. Handle raw Python dictionary
+    if isinstance(result, dict):
+        if set(result.keys()) == {"result"}:
+            return _make_json_safe(result["result"])
+        
+        # Parse MCP JSON-RPC format {"content": [{"type": "text", "text": "..."}]}
+        if "content" in result and isinstance(result["content"], list):
+            text_chunks = [
+                c.get("text", "") for c in result["content"] if isinstance(c, dict) and "text" in c
+            ]
+            if text_chunks:
+                combined_text = "\n".join(text_chunks).strip()
+                return _parse_json_text(combined_text)
+        return _make_json_safe(result)
+
+    # 4. Handle raw string
+    if isinstance(result, str):
+        return _parse_json_text(result)
+
+    # 5. Handle LangChain object with .content blocks
+    if hasattr(result, "content"):
+        content = getattr(result, "content", [])
+        text_chunks = [
+            block.text for block in content if hasattr(block, "text") and isinstance(block.text, str)
+        ]
+        if text_chunks:
+            combined_text = "\n".join(text_chunks).strip()
+            return _parse_json_text(combined_text)
+
+    return _make_json_safe(result)
+
+
 async def get_sse_tools_direct(server_name: str, sse_url: str, api_key: str,
-                                prefix: str = "", timeout: float = 30.0) -> list:
+                               prefix: str = "", timeout: float = 30.0) -> list:
     """
     Discover AND wrap tools from an SSE MCP server entirely in-process.
     Returns LangChain StructuredTool objects with async execution support.
@@ -299,9 +376,7 @@ async def get_sse_tools_direct(server_name: str, sse_url: str, api_key: str,
         async def _arun(_n=_tname, _u=_url, _k=_key, _p=_pfx, **kwargs):
             result = await _sse_rpc(_u, _k, _p, "tools/call",
                                     {"name": _n, "arguments": kwargs}, timeout=60.0)
-            content = result.get("content", [])
-            parts = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
-            return "\n".join(parts) if parts else str(result)
+            return _normalize_tool_result(result)
 
         lc_tools.append(StructuredTool(
             name=name,
@@ -336,6 +411,29 @@ async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
                 client = MultiServerMCPClient({server_name: server_config})
                 # Use a longer timeout (60s) for tool discovery to account for slow startup (especially on Windows)
                 tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+                
+                # Wrap all retrieved tools to ensure structured JSON output
+                wrapped_tools = []
+                for t in tools:
+                    orig_arun = getattr(t, "coroutine", None)
+                    orig_run = getattr(t, "func", None)
+                    
+                    async def wrapped_arun_fn(*args, _orig=orig_arun, **kwargs):
+                        res = await _orig(*args, **kwargs)
+                        return _normalize_tool_result(res)
+
+                    def wrapped_run_fn(*args, _orig=orig_run, **kwargs):
+                        res = _orig(*args, **kwargs)
+                        return _normalize_tool_result(res)
+                    
+                    wrapped_tools.append(StructuredTool(
+                        name=t.name,
+                        description=t.description,
+                        args_schema=t.args_schema,
+                        func=wrapped_run_fn if orig_run else None,
+                        coroutine=wrapped_arun_fn if orig_arun else None
+                    ))
+                tools = wrapped_tools
 
             all_tools.extend(tools)
             print(f"✅ Loaded {len(tools)} tools from '{server_name}'")
