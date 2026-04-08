@@ -12,7 +12,7 @@ import uvicorn
 import httpx
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
@@ -22,7 +22,9 @@ from urllib.parse import urlparse as _urlparse
 
 load_dotenv()
 
-# Project root resolution that works when imported, run directly, or as a PyInstaller bundle
+# -------------------------
+# PROJECT ROOT
+# -------------------------
 if getattr(sys, 'frozen', False):
     project_root = os.path.dirname(sys.executable)
 else:
@@ -31,698 +33,227 @@ else:
     project_root = os.path.abspath(os.path.join(client_dir, ".."))
 
 
-def _resolve_placeholder(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-
-    if value.startswith("${") and value.endswith("}"):
-        return os.getenv(value[2:-1], "")
-
-    if value.startswith("env:"):
-        return os.getenv(value[4:], "")
-
-    return value
-
-
-def _resolve_headers(settings: dict) -> dict:
-    headers = settings.get("headers", {}) or {}
-    resolved_headers = {
-        key: _resolve_placeholder(val)
-        for key, val in headers.items()
-    }
-
-    api_key = _resolve_placeholder(settings.get("api_key"))
-    if api_key:
-        resolved_headers.setdefault("x-api-key", api_key)
-
-    return {
-        key: val
-        for key, val in resolved_headers.items()
-        if val not in (None, "")
-    }
-
-
-def _normalize_transport(value: str) -> str:
-    transport = str(value or "stdio").strip().lower().replace("-", "_")
-    if transport == "streamablehttp":
-        return "streamable_http"
-    return transport
-
-
-# ---------------------------------------------------------------------------
-# JSON normalization helpers
-# ---------------------------------------------------------------------------
-
-def _make_json_safe(value: Any) -> Any:
-    """
-    Convert common Python / Pydantic / dataclass objects into JSON-safe types.
-    """
+# -------------------------
+# JSON NORMALIZATION (LIKE YOUR REF CLIENT)
+# -------------------------
+def _make_json_safe(value):
     if hasattr(value, "model_dump"):
         return _make_json_safe(value.model_dump())
 
-    try:
-        from dataclasses import asdict, is_dataclass
-        if is_dataclass(value):
-            return _make_json_safe(asdict(value))
-    except Exception:
-        pass
+    from dataclasses import asdict, is_dataclass
+    if is_dataclass(value):
+        return _make_json_safe(asdict(value))
 
     if isinstance(value, dict):
-        return {
-            str(key): _make_json_safe(item)
-            for key, item in value.items()
-        }
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
 
-    if isinstance(value, (list, tuple, set)):
-        return [_make_json_safe(item) for item in value]
-
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except Exception:
-            return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(v) for v in value]
 
     return value
 
 
-def _parse_json_text(value: Any) -> Any:
-    """
-    If value is a JSON string, return parsed JSON.
-    Otherwise return value unchanged.
-    """
+def _parse_json_text(value):
     if not isinstance(value, str):
         return value
 
-    text = value.strip()
-    if not text:
+    try:
+        return _make_json_safe(json.loads(value))
+    except:
         return value
 
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return value
 
-    return _make_json_safe(parsed)
-
-
-def _normalize_tool_result(result: Any) -> Any:
-    """
-    Normalize any tool result into a JSON-safe Python object.
-    This mirrors the behavior in your reference client.
-    """
-    if result is None:
-        return None
-
-    # Pydantic / dataclass / nested object handling
-    if hasattr(result, "model_dump"):
-        return _normalize_tool_result(result.model_dump())
-
-    try:
-        from dataclasses import asdict, is_dataclass
-        if is_dataclass(result):
-            return _normalize_tool_result(asdict(result))
-    except Exception:
-        pass
-
-    # Common "data" field
+def _normalize_tool_result(result):
     data = getattr(result, "data", None)
     if data is not None:
         if isinstance(data, str):
             return _parse_json_text(data)
         return _make_json_safe(data)
 
-    # structured_content / structuredContent
-    structured_content = getattr(result, "structured_content", None)
-    if structured_content is None:
-        structured_content = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None) or getattr(result, "structuredContent", None)
+    if structured is not None:
+        if isinstance(structured, dict) and set(structured.keys()) == {"result"}:
+            return _make_json_safe(structured["result"])
+        return _make_json_safe(structured)
 
-    if structured_content is not None:
-        if isinstance(structured_content, dict) and set(structured_content.keys()) == {"result"}:
-            return _normalize_tool_result(structured_content["result"])
-        return _make_json_safe(structured_content)
-
-    # Direct dict
     if isinstance(result, dict):
         if set(result.keys()) == {"result"}:
-            return _normalize_tool_result(result["result"])
+            return _make_json_safe(result["result"])
         return _make_json_safe(result)
 
-    # Direct JSON string
     if isinstance(result, str):
         return _parse_json_text(result)
 
-    # MCP content blocks
     content = getattr(result, "content", None) or []
-    if isinstance(content, list) and content:
-        text_chunks = []
-        for block in content:
-            if isinstance(block, dict):
-                if "text" in block and isinstance(block["text"], str):
-                    text_chunks.append(block["text"])
-                else:
-                    text_chunks.append(json.dumps(_make_json_safe(block), ensure_ascii=False))
-            elif hasattr(block, "text") and isinstance(block.text, str):
-                text_chunks.append(block.text)
-            else:
-                text_chunks.append(str(block))
+    texts = [c.text for c in content if hasattr(c, "text")]
 
-        if text_chunks:
-            combined_text = "\n".join(text_chunks).strip()
-            return _parse_json_text(combined_text)
+    if texts:
+        return _parse_json_text("\n".join(texts))
 
     return _make_json_safe(result)
 
 
-def _format_tool_output_for_llm(result: Any) -> str:
-    """
-    Convert normalized output into a clean JSON string for LangGraph/LangChain tool messages.
-    """
-    normalized = _normalize_tool_result(result)
-
-    if normalized is None:
-        return "null"
-
-    if isinstance(normalized, (dict, list)):
+# -------------------------
+# TOOL WRAPPER (FORCE JSON)
+# -------------------------
+def _wrap_tool(tool):
+    async def _arun(**kwargs):
+        raw = await tool.ainvoke(kwargs)
+        normalized = _normalize_tool_result(raw)
         return json.dumps(normalized, ensure_ascii=False)
 
-    if isinstance(normalized, str):
-        parsed = _parse_json_text(normalized)
-        if isinstance(parsed, (dict, list)):
-            return json.dumps(parsed, ensure_ascii=False)
-        return normalized
-
-    safe_value = _make_json_safe(normalized)
-    if isinstance(safe_value, (dict, list)):
-        return json.dumps(safe_value, ensure_ascii=False)
-
-    return json.dumps(safe_value, ensure_ascii=False) if safe_value is not None else "null"
-
-
-async def _call_tool_like_async(tool: Any, args: dict) -> Any:
-    """
-    Call a LangChain tool object safely from async code.
-    """
-    if hasattr(tool, "ainvoke"):
-        return await tool.ainvoke(args)
-
-    if hasattr(tool, "invoke"):
-        return await asyncio.to_thread(tool.invoke, args)
-
-    if callable(tool):
-        maybe_result = tool(args)
-        if asyncio.iscoroutine(maybe_result):
-            return await maybe_result
-        return maybe_result
-
-    raise TypeError(f"Unsupported tool type: {type(tool)}")
-
-
-def _make_tool_input_model(tool_name: str, schema: dict):
-    """
-    Build a Pydantic model from an MCP tool's inputSchema.
-    """
-    properties = schema.get("properties", {})
-    required_fields = schema.get("required", [])
-    fields: dict = {}
-
-    for pname, pschema in properties.items():
-        ptype_str = pschema.get("type", "string")
-        ptype: Any = str
-
-        if ptype_str in ("number", "integer"):
-            ptype = float
-        elif ptype_str == "boolean":
-            ptype = bool
-        elif ptype_str == "array":
-            ptype = list
-        elif ptype_str == "object":
-            ptype = dict
-
-        default = ... if pname in required_fields else None
-        desc = pschema.get("description", pname)
-        fields[pname] = (ptype, Field(default, description=desc))
-
-    if not fields:
-        return create_model(f"{tool_name}Input")
-
-    return create_model(f"{tool_name}Input", **fields)
-
-
-def _wrap_tool_with_json_output(tool: Any) -> StructuredTool:
-    """
-    Wrap a discovered LangChain tool so its output is normalized to JSON string.
-    """
-    tool_name = getattr(tool, "name", "unknown_tool")
-    tool_desc = getattr(tool, "description", "")
-    args_schema = getattr(tool, "args_schema", None)
-
-    if args_schema is None:
-        args_schema = create_model(f"{tool_name}Input")
-
-    async def _arun(**kwargs):
-        raw_result = await _call_tool_like_async(tool, kwargs)
-        return _format_tool_output_for_llm(raw_result)
-
     return StructuredTool(
-        name=tool_name,
-        description=tool_desc,
-        args_schema=args_schema,
+        name=tool.name,
+        description=tool.description,
+        args_schema=tool.args_schema,
         coroutine=_arun,
     )
 
 
-def _extract_message_content(message: Any) -> Any:
-    """
-    Extract text/content from the final assistant message.
-    """
-    content = getattr(message, "content", message)
-
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                if "text" in item and isinstance(item["text"], str):
-                    parts.append(item["text"])
-                else:
-                    parts.append(json.dumps(_make_json_safe(item), ensure_ascii=False))
-            else:
-                parts.append(str(item))
-        content = "".join(parts).strip()
-
-    return content
-
-
-def _maybe_parse_json_response(value: Any) -> Any:
-    """
-    If a response is JSON text, convert it to dict/list.
-    """
-    if isinstance(value, (dict, list)):
-        return value
-
-    if isinstance(value, str):
-        parsed = _parse_json_text(value)
-        if parsed != value:
-            return parsed
-
-    return value
-
-
-# ---------------------------------------------------------------------------
-# In-process SSE MCP client
-# ---------------------------------------------------------------------------
-
-async def _sse_rpc(
-    sse_url: str,
-    api_key: str,
-    prefix: str,
-    method: str,
-    params: dict,
-    timeout: float = 30.0
-) -> dict:
-    """
-    Open a fresh SSE session, perform the MCP initialize handshake,
-    execute ONE method call, and return the JSON-RPC result dict.
-    """
-    sse_hdrs = {
-        "x-api-key": api_key,
-        "Accept": "text/event-stream",
-        "Cache-Control": "no-store",
-    }
-    post_hdrs = {
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-    }
-    q: asyncio.Queue = asyncio.Queue()
-    ready = asyncio.Event()
-    purl: list = [None]
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as http:
-
-        async def _sse_reader():
-            async with http.stream("GET", sse_url, headers=sse_hdrs) as resp:
-                resp.raise_for_status()
-                async for ln in resp.aiter_lines():
-                    if not ln or ln.startswith(":") or ln.startswith("event:"):
-                        continue
-                    if ln.startswith("data:"):
-                        data = ln[5:].strip()
-                        if purl[0] is None:
-                            path = (prefix + data) if prefix and not data.startswith(prefix) else data
-                            p = _urlparse(sse_url)
-                            purl[0] = f"{p.scheme}://{p.netloc}{path}"
-                            ready.set()
-                        else:
-                            try:
-                                await q.put(json.loads(data))
-                            except Exception:
-                                pass
-
-        sse_task = asyncio.ensure_future(_sse_reader())
-        try:
-            await asyncio.wait_for(ready.wait(), timeout=timeout)
-            url = purl[0]
-
-            # MCP initialize
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0",
-                "id": 0,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "mcp-gateway",
-                        "version": "1.0"
-                    }
-                }
-            })
-            await asyncio.wait_for(q.get(), timeout=timeout)
-
-            # initialized notification
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            })
-
-            # actual method call
-            await http.post(url, headers=post_hdrs, json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params
-            })
-
-            result_msg = await asyncio.wait_for(q.get(), timeout=timeout)
-            return result_msg.get("result", {})
-        finally:
-            sse_task.cancel()
-            try:
-                await sse_task
-            except asyncio.CancelledError:
-                pass
-
-
-async def get_sse_tools_direct(
-    server_name: str,
-    sse_url: str,
-    api_key: str,
-    prefix: str = "",
-    timeout: float = 30.0
-) -> list:
-    """
-    Discover AND wrap tools from an SSE MCP server entirely in-process.
-    Returns LangChain StructuredTool objects with async execution support.
-    """
-    raw = await _sse_rpc(sse_url, api_key, prefix, "tools/list", {}, timeout=timeout)
-    tool_defs = raw.get("tools", [])
-    lc_tools = []
-
-    for t in tool_defs:
-        name = t["name"]
-        desc = t.get("description", "")
-        schema = t.get("inputSchema", {})
-        input_model = _make_tool_input_model(name, schema)
-
-        _url, _key, _pfx, _tname = sse_url, api_key, prefix, name
-
-        async def _arun(_n=_tname, _u=_url, _k=_key, _p=_pfx, **kwargs):
-            result = await _sse_rpc(
-                _u,
-                _k,
-                _p,
-                "tools/call",
-                {"name": _n, "arguments": kwargs},
-                timeout=60.0,
-            )
-            return _format_tool_output_for_llm(result)
-
-        lc_tools.append(StructuredTool(
-            name=name,
-            description=desc,
-            args_schema=input_model,
-            coroutine=_arun,
-        ))
-
-    return lc_tools
-
-
+# -------------------------
+# CONFIG LOADING
+# -------------------------
 def load_mcp_config():
     config_path = os.path.join(project_root, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at: {config_path}")
 
-    print(f"📂 Reading config from: {config_path}")
     with open(config_path, "r") as f:
-        config_data = json.load(f)
+        data = json.load(f)
 
-    if "mcpServers" in config_data:
-        config_data = config_data["mcpServers"]
+    if "mcpServers" in data:
+        data = data["mcpServers"]
 
-    servers = {}
-    for server_name, settings in config_data.items():
-        transport = _normalize_transport(settings.get("transport", "stdio"))
-
-        if transport == "sse":
-            url = _resolve_placeholder(settings.get("url"))
-            headers = _resolve_headers(settings)
-            api_key = _resolve_placeholder(
-                settings.get("api_key") or settings.get("headers", {}).get("x-api-key")
-            )
-            prefix = _resolve_placeholder(settings.get("prefix", ""))
-
-            if not url:
-                print(f"⚠️ Skipping SSE server '{server_name}': URL or API key missing.")
-                continue
-
-            servers[server_name] = {
-                "_transport": "sse_direct",
-                "url": url,
-                "api_key": api_key,
-                "prefix": prefix,
-            }
-            print(f"🌉 SSE direct registered: {server_name} → {url}")
-
-        elif transport in {"http", "streamable_http"}:
-            url = _resolve_placeholder(settings.get("url"))
-            headers = _resolve_headers(settings)
-
-            if not url:
-                print(f"Skipping HTTP server '{server_name}': URL missing.")
-                continue
-
-            server_config = {
-                "transport": "http",
-                "url": url,
-            }
-            if headers:
-                server_config["headers"] = headers
-
-            servers[server_name] = server_config
-            print(f"HTTP MCP registered: {server_name} -> {url}")
-
-        elif transport == "stdio":
-            custom_command = settings.get("command")
-            custom_args = settings.get("args", [])
-            custom_env = settings.get("env", {})
-
-            resolved_env = {
-                k: os.getenv(v, v) for k, v in custom_env.items()
-            }
-            full_env = {**os.environ, **resolved_env} if resolved_env else None
-
-            if custom_command:
-                executable = custom_command
-                if custom_command == "python" or custom_command == "python3":
-                    executable = sys.executable
-
-                if not os.path.isabs(executable) and not executable.startswith(("uvx", "npx")):
-                    candidate_path = os.path.abspath(os.path.join(project_root, executable))
-                    if os.path.exists(candidate_path):
-                        executable = candidate_path
-                    elif os.path.exists(candidate_path + ".exe"):
-                        executable = candidate_path + ".exe"
-
-                server_config = {
-                    "transport": "stdio",
-                    "command": executable,
-                    "args": custom_args,
-                }
-                if full_env:
-                    server_config["env"] = full_env
-
-                servers[server_name] = server_config
-                print(f"🔧 stdio (custom cmd) registered: {server_name} → {executable}")
-
-            else:
-                script_rel_path = settings.get("script_path")
-                if not script_rel_path:
-                    continue
-                script_abs_path = os.path.join(project_root, script_rel_path)
-                servers[server_name] = {
-                    "transport": "stdio",
-                    "command": sys.executable,
-                    "args": [script_abs_path],
-                }
-                print(f"🖥️ stdio server registered: {server_name} → {script_abs_path}")
-
-    return servers
+    return data
 
 
-async def get_tools_safe(all_servers: dict) -> tuple[list, list]:
-    """
-    Load tools from all configured MCP servers, and wrap every tool so it returns JSON-safe output.
-    """
+# -------------------------
+# TOOL LOADER
+# -------------------------
+async def get_tools_safe(all_servers):
     all_tools = []
-    failed_servers = []
+    failed = []
 
-    for server_name, server_config in all_servers.items():
+    for name, cfg in all_servers.items():
         try:
-            print(f"🔌 Connecting to '{server_name}'...")
+            client = MultiServerMCPClient({name: cfg})
+            tools = await client.get_tools()
 
-            if server_config.get("_transport") == "sse_direct":
-                tools = await asyncio.wait_for(
-                    get_sse_tools_direct(
-                        server_name,
-                        server_config["url"],
-                        server_config["api_key"],
-                        server_config.get("prefix", ""),
-                    ),
-                    timeout=30.0,
-                )
-            else:
-                client = MultiServerMCPClient({server_name: server_config})
-                raw_tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+            wrapped = [_wrap_tool(t) for t in tools]
 
-                # Wrap each discovered tool so its output becomes clean JSON text
-                tools = [_wrap_tool_with_json_output(tool) for tool in raw_tools]
+            all_tools.extend(wrapped)
+            print(f"✅ {name}: {len(wrapped)} tools")
 
-            all_tools.extend(tools)
-            print(f"✅ Loaded {len(tools)} tools from '{server_name}'")
-
-        except asyncio.TimeoutError:
-            print(f"⏱️ Timeout connecting to '{server_name}' — skipping.")
-            failed_servers.append(server_name)
         except Exception as e:
-            print(f"❌ Failed to load tools from '{server_name}': {e}")
-            failed_servers.append(server_name)
+            print(f"❌ {name} failed: {e}")
+            failed.append(name)
 
-    return all_tools, failed_servers
+    return all_tools, failed
 
 
+# -------------------------
+# GLOBALS
+# -------------------------
 mcp_servers = {}
 cached_tools = []
 failed_servers = []
 
 
+# -------------------------
+# FASTAPI LIFESPAN
+# -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_servers, cached_tools, failed_servers
-    try:
-        mcp_servers = load_mcp_config()
-        print(f"🔌 Servers configured: {list(mcp_servers.keys())}")
 
-        print("🔍 Initializing MCP tools...")
-        cached_tools, failed_servers = await get_tools_safe(mcp_servers)
+    mcp_servers = load_mcp_config()
+    cached_tools, failed_servers = await get_tools_safe(mcp_servers)
 
-        if failed_servers:
-            print(f"⚠️ Some servers failed to load at startup: {failed_servers}")
-        print(f"✅ Startup complete. {len(cached_tools)} tools cached.")
-
-        yield
-    except Exception as e:
-        print(f"❌ Error during startup: {e}")
-        raise
-    finally:
-        print("🔌 Shutting down...")
+    yield
 
 
 app = FastAPI(lifespan=lifespan)
 
 
+# -------------------------
+# REQUEST MODEL
+# -------------------------
 class QueryRequest(BaseModel):
     prompt: str
-    thread_id: str = "default_thread"
+    thread_id: str = "default"
 
 
 memory = MemorySaver()
 
 
+# -------------------------
+# CHAT ENDPOINT (CRITICAL FIX HERE)
+# -------------------------
 @app.post("/chat")
-async def chat_endpoint(request: QueryRequest):
-    global mcp_servers, cached_tools, failed_servers
+async def chat_endpoint(req: QueryRequest):
 
-    if not mcp_servers:
-        raise HTTPException(status_code=500, detail="No MCP servers configured")
+    if not cached_tools:
+        raise HTTPException(status_code=500, detail="No tools available")
 
     try:
-        tools = cached_tools
-        failed = failed_servers
-
-        if not tools:
-            if not failed:
-                raise HTTPException(status_code=503, detail="No tools available.")
-            else:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"No tools available. All servers failed at startup: {failed}"
-                )
-
-        if failed:
-            print(f"⚠️ Proceeding with cached tools (excluding failed: {failed})")
-
         llm = AzureChatOpenAI(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+            azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME")
         )
 
-        agent = create_react_agent(llm, tools, checkpointer=memory)
+        agent = create_react_agent(llm, cached_tools, checkpointer=memory)
 
-        config = {"configurable": {"thread_id": request.thread_id}}
-        inputs = {"messages": [HumanMessage(content=request.prompt)]}
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=req.prompt)]},
+            {"configurable": {"thread_id": req.thread_id}}
+        )
 
-        result = await agent.ainvoke(inputs, config=config)
+        messages = result.get("messages", [])
 
-        final_message = result["messages"][-1]
-        result_content = _extract_message_content(final_message)
-        result_content = _maybe_parse_json_response(result_content)
+        # ✅ RETURN TOOL OUTPUT DIRECTLY
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
 
-        if failed:
-            warning_text = f"These servers were unavailable: {failed}"
+        if tool_msgs:
+            last = tool_msgs[-1]
 
-            if isinstance(result_content, dict):
-                result_content["warnings"] = warning_text
-            else:
-                result_content = {
-                    "response": result_content,
-                    "warnings": warning_text,
+            try:
+                return {
+                    "response": json.loads(last.content),
+                    "source": "tool"
+                }
+            except:
+                return {
+                    "response": last.content,
+                    "source": "tool"
                 }
 
-        return {"response": result_content}
+        # fallback
+        return {
+            "response": messages[-1].content,
+            "source": "llm"
+        }
 
-    except HTTPException:
-        raise
     except Exception as e:
-        print("❌ Exception in chat_endpoint:")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# -------------------------
+# TOOLS ENDPOINT
+# -------------------------
 @app.get("/tools")
 async def list_tools():
     return {
-        "loaded": [t.name for t in cached_tools],
-        "failed_servers": failed_servers
+        "tools": [t.name for t in cached_tools],
+        "failed": failed_servers
     }
 
 
-def start_gateway(host="0.0.0.0", port=8010):
-    print(f"🚀 Starting MCP Gateway on {host}:{port}...")
-    uvicorn.run(app, host=host, port=port)
+# -------------------------
+# RUN
+# -------------------------
+def start_gateway():
+    uvicorn.run(app, host="0.0.0.0", port=8010)
 
 
 if __name__ == "__main__":
