@@ -252,8 +252,9 @@ async def list_tools():
 # -------------------------
 # RUN
 # -------------------------
-def start_gateway():
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+def start_gateway(host="0.0.0.0", port=8010):
+    print(f"🚀 Starting MCP Gateway on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
